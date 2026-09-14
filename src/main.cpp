@@ -1,5 +1,5 @@
 #include <SPI.h>
-#include <FreqCountRP2.h>
+#include <RpmCounter.h>
 
 // --- PIN DEFINITIONS ---
 const int PIN_RPM1   = 1;  // Must be ODD
@@ -8,6 +8,11 @@ const int PIN_SHIFT  = 26; // Analog A0
 const int PIN_ADS_CS   = 17; 
 const int PIN_ADS_DRDY = 20; 
 const int PIN_ADS_RST  = 21; 
+
+// Number of optoisolator pulses generated per wheel revolution.
+// Set these to the physical spoke count for each RPM wheel.
+const uint16_t RPM1_SPOKES = 1;
+const uint16_t RPM2_SPOKES = 1;
 
 #define ADS_CMD_RDATA  0x01
 #define ADS_REG_MUX    0x01
@@ -44,11 +49,13 @@ void updateIntervals();
 // =========================================================================
 void setup1() {
   analogReadResolution(12);
+
+  // Optoisolator outputs are expected to be open-collector/open-drain.
+  // Keep both frequency inputs high when the optocoupler is off.
+  pinMode(PIN_RPM1, INPUT_PULLUP);
+  pinMode(PIN_RPM2, INPUT_PULLUP);
   
-  // Note: Hardware counters run constantly in the background. 
-  // Core 1 always tracks pulses; runtime commands determine if Core 0 packages them.
-  FreqCountRP2.beginTimer(PIN_RPM1, 50); 
-  FreqCountRP2.beginTimer(PIN_RPM2, 50);
+  RpmCounter::begin(PIN_RPM1, PIN_RPM2, RPM1_SPOKES, RPM2_SPOKES, 50);
 
   pinMode(PIN_ADS_CS, OUTPUT);
   pinMode(PIN_ADS_RST, OUTPUT);
@@ -81,6 +88,9 @@ int32_t readADS1256(uint8_t channel) {
 
 void loop1() {
   SensorPacket local_packet;
+  uint32_t measuredRpm1 = 0;
+  uint32_t measuredRpm2 = 0;
+  const bool rpmReady = RpmCounter::update(measuredRpm1, measuredRpm2);
 
   // Bench mode leaves the hardware setup intact but bypasses all sensor reads.
   // Disable it over serial to return to the real sensor path without reflashing.
@@ -92,9 +102,9 @@ void loop1() {
     local_packet.torq1 = 420 + (sin(phase * 0.8f) * 105);
     local_packet.torq2 = 335 + (sin((phase * 0.8f) - 0.3f) * 88);
   } else {
-    if (FreqCountRP2.available()) {
-      local_packet.rpm1 = FreqCountRP2.read() * 12000;
-      local_packet.rpm2 = FreqCountRP2.read() * 12000;
+    if (rpmReady) {
+      local_packet.rpm1 = measuredRpm1;
+      local_packet.rpm2 = measuredRpm2;
     }
 
     local_packet.shift = analogRead(PIN_SHIFT);
