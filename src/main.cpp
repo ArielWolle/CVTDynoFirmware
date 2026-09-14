@@ -36,6 +36,8 @@ struct __attribute__((__packed__)) SensorPacket {
 
 volatile SensorPacket shared_data;
 
+void updateIntervals();
+
 // =========================================================================
 // CORE 1: DYNAMIC HARDWARE SENSOR COLLECTOR
 // =========================================================================
@@ -144,7 +146,7 @@ void handleIncomingCommands() {
     uint8_t valL = Serial.read();
     uint16_t combined_val = ((uint16_t)valH << 8) | valL;
 
-    if (ch >= 0 && ch <= 4) {
+    if (ch <= 4) {
       if (cmd == 0x01) { 
         // Command 1: Toggle stream active states
         cfg_write_en[ch] = (combined_val == 1);
@@ -178,7 +180,11 @@ void loop() {
       
       if (!data_copied) {
         noInterrupts();
-        packet_to_send = shared_data;
+        packet_to_send.rpm1 = shared_data.rpm1;
+        packet_to_send.rpm2 = shared_data.rpm2;
+        packet_to_send.shift = shared_data.shift;
+        packet_to_send.torq1 = shared_data.torq1;
+        packet_to_send.torq2 = shared_data.torq2;
         interrupts();
         data_copied = true;
       }
@@ -199,7 +205,8 @@ void loop() {
       }
 
       Serial.write((uint8_t*)&sync_head, 2);
-      Serial.write(&ch, 1);
+      uint8_t channel = (uint8_t)i;
+      Serial.write(&channel, 1);
       Serial.write(&padding, 1);
       Serial.write((uint8_t*)&payload_val, 4);
     }
