@@ -17,6 +17,7 @@ const int PIN_ADS_RST  = 21;
 // =========================================================================
 volatile bool cfg_write_en[5] = {true, true, true, true, true}; // RPM1, RPM2, SHIFT, T1, T2
 volatile uint16_t cfg_freq[5] = {20, 20, 10, 50, 50};           // Frequencies in Hz
+volatile bool demo_mode = false;                                // Command 0x04: synthetic bench data
 
 // Microsecond tracking variables for independent scheduling on Core 0
 unsigned long last_tx_us[5]  = {0, 0, 0, 0, 0};
@@ -81,16 +82,27 @@ int32_t readADS1256(uint8_t channel) {
 void loop1() {
   SensorPacket local_packet;
 
-  if (FreqCountRP2.available()) {
-    local_packet.rpm1 = FreqCountRP2.read() * 12000;
-    local_packet.rpm2 = FreqCountRP2.read() * 12000;
-  }
+  // Bench mode leaves the hardware setup intact but bypasses all sensor reads.
+  // Disable it over serial to return to the real sensor path without reflashing.
+  if (demo_mode) {
+    const float phase = millis() / 1000.0f;
+    local_packet.rpm1 = 4200 + (sin(phase) * 1100) + (phase * 18);
+    local_packet.rpm2 = 2850 + (sin(phase - 0.55f) * 720) + (phase * 12);
+    local_packet.shift = 1800 + (sin(phase * 0.45f) * 850);
+    local_packet.torq1 = 420 + (sin(phase * 0.8f) * 105);
+    local_packet.torq2 = 335 + (sin((phase * 0.8f) - 0.3f) * 88);
+  } else {
+    if (FreqCountRP2.available()) {
+      local_packet.rpm1 = FreqCountRP2.read() * 12000;
+      local_packet.rpm2 = FreqCountRP2.read() * 12000;
+    }
 
-  local_packet.shift = analogRead(PIN_SHIFT);
+    local_packet.shift = analogRead(PIN_SHIFT);
 
-  if (digitalRead(PIN_ADS_DRDY) == LOW) {
-    local_packet.torq1 = readADS1256(0);
-    local_packet.torq2 = readADS1256(1);
+    if (digitalRead(PIN_ADS_DRDY) == LOW) {
+      local_packet.torq1 = readADS1256(0);
+      local_packet.torq2 = readADS1256(1);
+    }
   }
 
   noInterrupts();
@@ -146,7 +158,10 @@ void handleIncomingCommands() {
     uint8_t valL = Serial.read();
     uint16_t combined_val = ((uint16_t)valH << 8) | valL;
 
-    if (ch <= 4) {
+    if (cmd == 0x04) {
+      demo_mode = (combined_val == 1);
+      Serial.println(demo_mode ? "BENCH MODE ENABLED" : "BENCH MODE DISABLED");
+    } else if (ch <= 4) {
       if (cmd == 0x01) { 
         // Command 1: Toggle stream active states
         cfg_write_en[ch] = (combined_val == 1);
