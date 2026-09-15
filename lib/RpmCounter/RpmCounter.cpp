@@ -3,6 +3,8 @@
 namespace {
 volatile uint32_t primaryPulses = 0;
 volatile uint32_t secondaryPulses = 0;
+volatile uint32_t primaryTotalEdges = 0;
+volatile uint32_t secondaryTotalEdges = 0;
 uint8_t primaryPin = 0;
 uint8_t secondaryPin = 0;
 uint16_t primarySpokes = 1;
@@ -12,10 +14,12 @@ uint32_t windowStartMs = 0;
 
 void primaryEdge() {
   primaryPulses++;
+  primaryTotalEdges++;
 }
 
 void secondaryEdge() {
   secondaryPulses++;
+  secondaryTotalEdges++;
 }
 }
 
@@ -52,5 +56,12 @@ bool update(uint32_t& primaryRpm, uint32_t& secondaryRpm) {
   secondaryRpm = (secondaryCount * 60000.0f) / (elapsedMs * secondarySpokes);
   windowStartMs = nowMs;
   return true;
+}
+
+void readDiagnostics(uint32_t& primaryEdges, uint32_t& secondaryEdges) {
+  noInterrupts();
+  primaryEdges = primaryTotalEdges;
+  secondaryEdges = secondaryTotalEdges;
+  interrupts();
 }
 }

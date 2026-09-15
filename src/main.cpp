@@ -23,10 +23,12 @@ const uint16_t RPM2_SPOKES = 1;
 volatile bool cfg_write_en[5] = {true, true, true, true, true}; // RPM1, RPM2, SHIFT, T1, T2
 volatile uint16_t cfg_freq[5] = {20, 20, 10, 50, 50};           // Frequencies in Hz
 volatile bool demo_mode = false;                                // Command 0x04: synthetic bench data
+volatile bool rpm_pin_test = false;                             // Command 0x05: diagnostic pin reports
 
 // Microsecond tracking variables for independent scheduling on Core 0
 unsigned long last_tx_us[5]  = {0, 0, 0, 0, 0};
 volatile unsigned long intervals_us[5]; 
+unsigned long last_rpm_test_ms = 0;
 
 // =========================================================================
 // SENSOR DATA TYPES & BUFFERING
@@ -151,12 +153,28 @@ void updateIntervals() {
 void printCurrentConfig() {
   const char* labels[] = {"RPM1", "RPM2", "SHIFT", "TORQ1", "TORQ2"};
   Serial.println("\n--- CURRENT CONFIGURATION STATUS ---");
+  Serial.print("Bench mode: "); Serial.println(demo_mode ? "ENABLED" : "DISABLED");
+  Serial.print("RPM pin test: "); Serial.println(rpm_pin_test ? "ENABLED" : "DISABLED");
   for (int i = 0; i < 5; i++) {
     Serial.print("Channel ["); Serial.print(i); Serial.print("] ("); Serial.print(labels[i]); Serial.print("): ");
     Serial.print(cfg_write_en[i] ? "ENABLED" : "DISABLED");
     Serial.print(" | Target Tx Freq: "); Serial.print(cfg_freq[i]); Serial.println(" Hz");
   }
   Serial.println("------------------------------------\n");
+}
+
+void printRpmPinDiagnostics() {
+  uint32_t primaryEdges = 0;
+  uint32_t secondaryEdges = 0;
+  RpmCounter::readDiagnostics(primaryEdges, secondaryEdges);
+  Serial.print("RPM TEST | PIN_RPM1=");
+  Serial.print(digitalRead(PIN_RPM1) == HIGH ? "HIGH" : "LOW");
+  Serial.print(" edges=");
+  Serial.print(primaryEdges);
+  Serial.print(" | PIN_RPM2=");
+  Serial.print(digitalRead(PIN_RPM2) == HIGH ? "HIGH" : "LOW");
+  Serial.print(" edges=");
+  Serial.println(secondaryEdges);
 }
 
 void handleIncomingCommands() {
@@ -171,6 +189,9 @@ void handleIncomingCommands() {
     if (cmd == 0x04) {
       demo_mode = (combined_val == 1);
       Serial.println(demo_mode ? "BENCH MODE ENABLED" : "BENCH MODE DISABLED");
+    } else if (cmd == 0x05) {
+      rpm_pin_test = (combined_val == 1);
+      Serial.println(rpm_pin_test ? "RPM PIN TEST ENABLED" : "RPM PIN TEST DISABLED");
     } else if (ch <= 4) {
       if (cmd == 0x01) { 
         // Command 1: Toggle stream active states
@@ -193,6 +214,11 @@ void handleIncomingCommands() {
 void loop() {
   // Handle any inbound configuration parameters instantly
   handleIncomingCommands();
+
+  if (rpm_pin_test && millis() - last_rpm_test_ms >= 100) {
+    last_rpm_test_ms = millis();
+    printRpmPinDiagnostics();
+  }
 
   unsigned long now = micros();
   SensorPacket packet_to_send;
