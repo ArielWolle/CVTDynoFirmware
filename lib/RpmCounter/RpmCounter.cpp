@@ -7,23 +7,39 @@ volatile uint32_t primaryTotalEdges = 0;
 volatile uint32_t secondaryTotalEdges = 0;
 volatile uint32_t primaryInterruptEvents = 0;
 volatile uint32_t secondaryInterruptEvents = 0;
+volatile uint32_t primaryLastEdgeUs = 0;
+volatile uint32_t secondaryLastEdgeUs = 0;
+volatile uint32_t primaryPeriodUs = 0;
+volatile uint32_t secondaryPeriodUs = 0;
 uint8_t primaryPin = 0;
 uint8_t secondaryPin = 0;
 uint16_t primarySpokes = 1;
 uint16_t secondarySpokes = 1;
 uint32_t windowMs = 50;
 uint32_t windowStartMs = 0;
-uint32_t lastPrimaryEdgesForRpm = 0;
-uint32_t lastSecondaryEdgesForRpm = 0;
 bool interruptTestMode = false;
 
+constexpr uint32_t RPM_STALE_TIMEOUT_US = 500000;
+
 void primaryEdge() {
+  const uint32_t nowUs = micros();
+  if (primaryLastEdgeUs != 0) {
+    const uint32_t dt = nowUs - primaryLastEdgeUs;
+    primaryPeriodUs = primaryPeriodUs == 0 ? dt : (primaryPeriodUs * 3 + dt) / 4;
+  }
+  primaryLastEdgeUs = nowUs;
   primaryPulses++;
   primaryTotalEdges++;
   if (interruptTestMode) primaryInterruptEvents++;
 }
 
 void secondaryEdge() {
+  const uint32_t nowUs = micros();
+  if (secondaryLastEdgeUs != 0) {
+    const uint32_t dt = nowUs - secondaryLastEdgeUs;
+    secondaryPeriodUs = secondaryPeriodUs == 0 ? dt : (secondaryPeriodUs * 3 + dt) / 4;
+  }
+  secondaryLastEdgeUs = nowUs;
   secondaryPulses++;
   secondaryTotalEdges++;
   if (interruptTestMode) secondaryInterruptEvents++;
@@ -44,8 +60,10 @@ void begin(uint8_t newPrimaryPin, uint8_t newSecondaryPin, uint16_t newPrimarySp
   secondaryTotalEdges = 0;
   primaryInterruptEvents = 0;
   secondaryInterruptEvents = 0;
-  lastPrimaryEdgesForRpm = 0;
-  lastSecondaryEdgesForRpm = 0;
+  primaryLastEdgeUs = 0;
+  secondaryLastEdgeUs = 0;
+  primaryPeriodUs = 0;
+  secondaryPeriodUs = 0;
 
   // Optoisolator outputs are normally open-collector/open-drain.
   pinMode(primaryPin, INPUT_PULLUP);
@@ -58,31 +76,38 @@ bool update(uint32_t& primaryRpm, uint32_t& secondaryRpm) {
   const uint32_t nowMs = millis();
   const uint32_t elapsedMs = nowMs - windowStartMs;
   if (elapsedMs < windowMs) return false;
+  const uint32_t nowUs = micros();
 
   noInterrupts();
   const uint32_t primaryCount = primaryPulses;
   const uint32_t secondaryCount = secondaryPulses;
-  const uint32_t primaryEdges = primaryTotalEdges;
-  const uint32_t secondaryEdges = secondaryTotalEdges;
+  const uint32_t primaryLastUs = primaryLastEdgeUs;
+  const uint32_t secondaryLastUs = secondaryLastEdgeUs;
+  const uint32_t primaryDtUs = primaryPeriodUs;
+  const uint32_t secondaryDtUs = secondaryPeriodUs;
   primaryPulses = 0;
   secondaryPulses = 0;
   interrupts();
 
-  // Use total-edge deltas for RPM so reporting remains stable even when
-  // test modes inspect/reset per-window pulse counters.
-  const uint32_t primaryDelta = primaryEdges - lastPrimaryEdgesForRpm;
-  const uint32_t secondaryDelta = secondaryEdges - lastSecondaryEdgesForRpm;
-  lastPrimaryEdgesForRpm = primaryEdges;
-  lastSecondaryEdgesForRpm = secondaryEdges;
+  const bool primaryRecent = primaryLastUs != 0 && (nowUs - primaryLastUs) <= RPM_STALE_TIMEOUT_US;
+  const bool secondaryRecent = secondaryLastUs != 0 && (nowUs - secondaryLastUs) <= RPM_STALE_TIMEOUT_US;
 
-  // Keep a tiny floor path using per-window counts to avoid reporting
-  // persistent zero if edge counters are delayed but pulse counters moved.
-  const uint32_t primaryForCalc = primaryDelta > 0 ? primaryDelta : primaryCount;
-  const uint32_t secondaryForCalc = secondaryDelta > 0 ? secondaryDelta : secondaryCount;
+  if (primaryRecent && primaryDtUs > 0) {
+    primaryRpm = (uint32_t)(60000000.0 / ((double)primaryDtUs * (double)primarySpokes));
+  } else {
+    primaryRpm = primaryCount > 0
+      ? (uint32_t)(((double)primaryCount * 60000.0) / ((double)elapsedMs * (double)primarySpokes))
+      : 0;
+  }
 
-  // RPM = (pulses * 60000) / (elapsed_ms * spokes)
-  primaryRpm = (uint32_t)(((double)primaryForCalc * 60000.0) / ((double)elapsedMs * (double)primarySpokes));
-  secondaryRpm = (uint32_t)(((double)secondaryForCalc * 60000.0) / ((double)elapsedMs * (double)secondarySpokes));
+  if (secondaryRecent && secondaryDtUs > 0) {
+    secondaryRpm = (uint32_t)(60000000.0 / ((double)secondaryDtUs * (double)secondarySpokes));
+  } else {
+    secondaryRpm = secondaryCount > 0
+      ? (uint32_t)(((double)secondaryCount * 60000.0) / ((double)elapsedMs * (double)secondarySpokes))
+      : 0;
+  }
+
   windowStartMs = nowMs;
   return true;
 }

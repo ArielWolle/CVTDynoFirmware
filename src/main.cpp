@@ -2,8 +2,8 @@
 #include <RpmCounter.h>
 
 // --- PIN DEFINITIONS ---
-const int PIN_RPM1   = 1;  // Must be ODD
-const int PIN_RPM2   = 3;  // Must be ODD
+const int PIN_RPM1   = 3;  // Must be ODD
+const int PIN_RPM2   = 1;  // Must be ODD
 const int PIN_SHIFT  = 26; // Analog A0
 const int PIN_ADS_CS   = 17; 
 const int PIN_ADS_DRDY = 20; 
@@ -61,7 +61,7 @@ void setup1() {
   pinMode(PIN_RPM1, INPUT_PULLUP);
   pinMode(PIN_RPM2, INPUT_PULLUP);
   
-  RpmCounter::begin(PIN_RPM1, PIN_RPM2, RPM1_SPOKES, RPM2_SPOKES, 50);
+  RpmCounter::begin(PIN_RPM1, PIN_RPM2, RPM1_SPOKES, RPM2_SPOKES, 20);
 
   pinMode(PIN_ADS_CS, OUTPUT);
   pinMode(PIN_ADS_RST, OUTPUT);
@@ -94,6 +94,14 @@ int32_t readADS1256(uint8_t channel) {
 
 void loop1() {
   SensorPacket local_packet;
+  noInterrupts();
+  local_packet.rpm1 = shared_data.rpm1;
+  local_packet.rpm2 = shared_data.rpm2;
+  local_packet.shift = shared_data.shift;
+  local_packet.torq1 = shared_data.torq1;
+  local_packet.torq2 = shared_data.torq2;
+  interrupts();
+
   uint32_t measuredRpm1 = 0;
   uint32_t measuredRpm2 = 0;
   const bool rpmReady = RpmCounter::update(measuredRpm1, measuredRpm2);
