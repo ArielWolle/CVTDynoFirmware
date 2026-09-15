@@ -13,6 +13,8 @@ uint16_t primarySpokes = 1;
 uint16_t secondarySpokes = 1;
 uint32_t windowMs = 50;
 uint32_t windowStartMs = 0;
+uint32_t lastPrimaryEdgesForRpm = 0;
+uint32_t lastSecondaryEdgesForRpm = 0;
 bool interruptTestMode = false;
 
 void primaryEdge() {
@@ -36,6 +38,14 @@ void begin(uint8_t newPrimaryPin, uint8_t newSecondaryPin, uint16_t newPrimarySp
   secondarySpokes = newSecondarySpokes > 0 ? newSecondarySpokes : 1;
   windowMs = newWindowMs;
   windowStartMs = millis();
+  primaryPulses = 0;
+  secondaryPulses = 0;
+  primaryTotalEdges = 0;
+  secondaryTotalEdges = 0;
+  primaryInterruptEvents = 0;
+  secondaryInterruptEvents = 0;
+  lastPrimaryEdgesForRpm = 0;
+  lastSecondaryEdgesForRpm = 0;
 
   // Optoisolator outputs are normally open-collector/open-drain.
   pinMode(primaryPin, INPUT_PULLUP);
@@ -52,14 +62,27 @@ bool update(uint32_t& primaryRpm, uint32_t& secondaryRpm) {
   noInterrupts();
   const uint32_t primaryCount = primaryPulses;
   const uint32_t secondaryCount = secondaryPulses;
+  const uint32_t primaryEdges = primaryTotalEdges;
+  const uint32_t secondaryEdges = secondaryTotalEdges;
   primaryPulses = 0;
   secondaryPulses = 0;
   interrupts();
 
-  // pulses / elapsed-ms * 60,000 converts pulse frequency to RPM.
-  // Formula: RPM = (pulses / spokes) / (elapsed_ms / 60000) = (pulses * 60000) / (elapsed_ms * spokes)
-  primaryRpm = (uint32_t)(((float)primaryCount * 60000.0f) / ((float)elapsedMs * (float)primarySpokes));
-  secondaryRpm = (uint32_t)(((float)secondaryCount * 60000.0f) / ((float)elapsedMs * (float)secondarySpokes));
+  // Use total-edge deltas for RPM so reporting remains stable even when
+  // test modes inspect/reset per-window pulse counters.
+  const uint32_t primaryDelta = primaryEdges - lastPrimaryEdgesForRpm;
+  const uint32_t secondaryDelta = secondaryEdges - lastSecondaryEdgesForRpm;
+  lastPrimaryEdgesForRpm = primaryEdges;
+  lastSecondaryEdgesForRpm = secondaryEdges;
+
+  // Keep a tiny floor path using per-window counts to avoid reporting
+  // persistent zero if edge counters are delayed but pulse counters moved.
+  const uint32_t primaryForCalc = primaryDelta > 0 ? primaryDelta : primaryCount;
+  const uint32_t secondaryForCalc = secondaryDelta > 0 ? secondaryDelta : secondaryCount;
+
+  // RPM = (pulses * 60000) / (elapsed_ms * spokes)
+  primaryRpm = (uint32_t)(((double)primaryForCalc * 60000.0) / ((double)elapsedMs * (double)primarySpokes));
+  secondaryRpm = (uint32_t)(((double)secondaryForCalc * 60000.0) / ((double)elapsedMs * (double)secondarySpokes));
   windowStartMs = nowMs;
   return true;
 }
