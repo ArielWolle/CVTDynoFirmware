@@ -5,6 +5,8 @@ volatile uint32_t primaryPulses = 0;
 volatile uint32_t secondaryPulses = 0;
 volatile uint32_t primaryTotalEdges = 0;
 volatile uint32_t secondaryTotalEdges = 0;
+volatile uint32_t primaryInterruptEvents = 0;
+volatile uint32_t secondaryInterruptEvents = 0;
 uint8_t primaryPin = 0;
 uint8_t secondaryPin = 0;
 uint16_t primarySpokes = 1;
@@ -16,17 +18,13 @@ bool interruptTestMode = false;
 void primaryEdge() {
   primaryPulses++;
   primaryTotalEdges++;
-  if (interruptTestMode) {
-    Serial.println("[INTERRUPT] PRIMARY edge detected");
-  }
+  if (interruptTestMode) primaryInterruptEvents++;
 }
 
 void secondaryEdge() {
   secondaryPulses++;
   secondaryTotalEdges++;
-  if (interruptTestMode) {
-    Serial.println("[INTERRUPT] SECONDARY edge detected");
-  }
+  if (interruptTestMode) secondaryInterruptEvents++;
 }
 }
 
@@ -70,6 +68,22 @@ void readDiagnostics(uint32_t& primaryEdges, uint32_t& secondaryEdges) {
   noInterrupts();
   primaryEdges = primaryTotalEdges;
   secondaryEdges = secondaryTotalEdges;
+  interrupts();
+}
+
+void readWindowCounts(uint32_t& primaryCount, uint32_t& secondaryCount) {
+  noInterrupts();
+  primaryCount = primaryPulses;
+  secondaryCount = secondaryPulses;
+  interrupts();
+}
+
+void readAndClearInterruptEvents(uint32_t& primaryEvents, uint32_t& secondaryEvents) {
+  noInterrupts();
+  primaryEvents = primaryInterruptEvents;
+  secondaryEvents = secondaryInterruptEvents;
+  primaryInterruptEvents = 0;
+  secondaryInterruptEvents = 0;
   interrupts();
 }
 

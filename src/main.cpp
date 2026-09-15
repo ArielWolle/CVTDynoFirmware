@@ -25,11 +25,14 @@ volatile uint16_t cfg_freq[5] = {20, 20, 10, 50, 50};           // Frequencies i
 volatile bool demo_mode = false;                                // Command 0x04: synthetic bench data
 volatile bool rpm_pin_test = false;                             // Command 0x05: diagnostic pin reports
 volatile bool rpm_interrupt_test = false;                       // Command 0x07: real-time interrupt logging
+volatile bool rpm_count_test = false;                           // Command 0x08: pulse count diagnostics
 
 // Microsecond tracking variables for independent scheduling on Core 0
 unsigned long last_tx_us[5]  = {0, 0, 0, 0, 0};
 volatile unsigned long intervals_us[5]; 
-unsigned long last_rpm_test_ms = 0;
+unsigned long last_rpm_pin_test_ms = 0;
+unsigned long last_rpm_count_test_ms = 0;
+unsigned long last_rpm_interrupt_test_ms = 0;
 
 // =========================================================================
 // SENSOR DATA TYPES & BUFFERING
@@ -157,6 +160,7 @@ void printCurrentConfig() {
   Serial.print("Bench mode: "); Serial.println(demo_mode ? "ENABLED" : "DISABLED");
   Serial.print("RPM pin test: "); Serial.println(rpm_pin_test ? "ENABLED" : "DISABLED");
   Serial.print("RPM interrupt test: "); Serial.println(rpm_interrupt_test ? "ENABLED" : "DISABLED");
+  Serial.print("RPM count test: "); Serial.println(rpm_count_test ? "ENABLED" : "DISABLED");
   
   uint16_t primarySpokes = 1;
   uint16_t secondarySpokes = 1;
@@ -184,6 +188,26 @@ void printRpmPinDiagnostics() {
   Serial.print(digitalRead(PIN_RPM2) == HIGH ? "HIGH" : "LOW");
   Serial.print(" edges=");
   Serial.println(secondaryEdges);
+}
+
+void printRpmCountDiagnostics() {
+  uint32_t primaryCount = 0;
+  uint32_t secondaryCount = 0;
+  RpmCounter::readWindowCounts(primaryCount, secondaryCount);
+  Serial.print("RPM COUNT TEST | RPM1 count=");
+  Serial.print(primaryCount);
+  Serial.print(" | RPM2 count=");
+  Serial.println(secondaryCount);
+}
+
+void printRpmInterruptDiagnostics() {
+  uint32_t primaryEvents = 0;
+  uint32_t secondaryEvents = 0;
+  RpmCounter::readAndClearInterruptEvents(primaryEvents, secondaryEvents);
+  Serial.print("RPM INTERRUPT TEST | PRIMARY edges=");
+  Serial.print(primaryEvents);
+  Serial.print(" | SECONDARY edges=");
+  Serial.println(secondaryEvents);
 }
 
 void handleIncomingCommands() {
@@ -230,17 +254,38 @@ void handleIncomingCommands() {
       rpm_interrupt_test = (combined_val == 1);
       RpmCounter::setInterruptTestMode(rpm_interrupt_test);
       Serial.println(rpm_interrupt_test ? "RPM INTERRUPT TEST ENABLED" : "RPM INTERRUPT TEST DISABLED");
+    } else if (cmd == 0x08) {
+      // Command 8: Toggle RPM count test mode
+      rpm_count_test = (combined_val == 1);
+      Serial.println(rpm_count_test ? "RPM COUNT TEST ENABLED" : "RPM COUNT TEST DISABLED");
     }
   }
 }
 
 void loop() {
-  // Handle any inbound configuration parameters instantly
+  SensorPacket local_packet;
+  noInterrupts();
+  local_packet.rpm1 = shared_data.rpm1;
+  local_packet.rpm2 = shared_data.rpm2;
+  local_packet.shift = shared_data.shift;
+  local_packet.torq1 = shared_data.torq1;
+  local_packet.torq2 = shared_data.torq2;
+  interrupts();
   handleIncomingCommands();
 
-  if (rpm_pin_test && millis() - last_rpm_test_ms >= 100) {
-    last_rpm_test_ms = millis();
+  if (rpm_pin_test && millis() - last_rpm_pin_test_ms >= 100) {
+    last_rpm_pin_test_ms = millis();
     printRpmPinDiagnostics();
+  }
+
+  if (rpm_count_test && millis() - last_rpm_count_test_ms >= 100) {
+    last_rpm_count_test_ms = millis();
+    printRpmCountDiagnostics();
+  }
+
+  if (rpm_interrupt_test && millis() - last_rpm_interrupt_test_ms >= 100) {
+    last_rpm_interrupt_test_ms = millis();
+    printRpmInterruptDiagnostics();
   }
 
   unsigned long now = micros();
