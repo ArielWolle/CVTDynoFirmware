@@ -11,15 +11,22 @@ uint16_t primarySpokes = 1;
 uint16_t secondarySpokes = 1;
 uint32_t windowMs = 50;
 uint32_t windowStartMs = 0;
+bool interruptTestMode = false;
 
 void primaryEdge() {
   primaryPulses++;
   primaryTotalEdges++;
+  if (interruptTestMode) {
+    Serial.println("[INTERRUPT] PRIMARY edge detected");
+  }
 }
 
 void secondaryEdge() {
   secondaryPulses++;
   secondaryTotalEdges++;
+  if (interruptTestMode) {
+    Serial.println("[INTERRUPT] SECONDARY edge detected");
+  }
 }
 }
 
@@ -52,8 +59,9 @@ bool update(uint32_t& primaryRpm, uint32_t& secondaryRpm) {
   interrupts();
 
   // pulses / elapsed-ms * 60,000 converts pulse frequency to RPM.
-  primaryRpm = (primaryCount * 60000.0f) / (elapsedMs * primarySpokes);
-  secondaryRpm = (secondaryCount * 60000.0f) / (elapsedMs * secondarySpokes);
+  // Formula: RPM = (pulses / spokes) / (elapsed_ms / 60000) = (pulses * 60000) / (elapsed_ms * spokes)
+  primaryRpm = (uint32_t)(((float)primaryCount * 60000.0f) / ((float)elapsedMs * (float)primarySpokes));
+  secondaryRpm = (uint32_t)(((float)secondaryCount * 60000.0f) / ((float)elapsedMs * (float)secondarySpokes));
   windowStartMs = nowMs;
   return true;
 }
@@ -63,5 +71,26 @@ void readDiagnostics(uint32_t& primaryEdges, uint32_t& secondaryEdges) {
   primaryEdges = primaryTotalEdges;
   secondaryEdges = secondaryTotalEdges;
   interrupts();
+}
+
+void setSpokes(uint8_t channel, uint16_t spokes) {
+  noInterrupts();
+  if (channel == 0) {
+    primarySpokes = spokes > 0 ? spokes : 1;
+  } else if (channel == 1) {
+    secondarySpokes = spokes > 0 ? spokes : 1;
+  }
+  interrupts();
+}
+
+void getSpokes(uint16_t& primaryOut, uint16_t& secondaryOut) {
+  noInterrupts();
+  primaryOut = primarySpokes;
+  secondaryOut = secondarySpokes;
+  interrupts();
+}
+
+void setInterruptTestMode(bool enabled) {
+  interruptTestMode = enabled;
 }
 }

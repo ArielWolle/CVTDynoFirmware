@@ -11,8 +11,8 @@ const int PIN_ADS_RST  = 21;
 
 // Number of optoisolator pulses generated per wheel revolution.
 // Set these to the physical spoke count for each RPM wheel.
-const uint16_t RPM1_SPOKES = 1;
-const uint16_t RPM2_SPOKES = 1;
+const uint16_t RPM1_SPOKES = 16;
+const uint16_t RPM2_SPOKES = 12;
 
 #define ADS_CMD_RDATA  0x01
 #define ADS_REG_MUX    0x01
@@ -24,6 +24,7 @@ volatile bool cfg_write_en[5] = {true, true, true, true, true}; // RPM1, RPM2, S
 volatile uint16_t cfg_freq[5] = {20, 20, 10, 50, 50};           // Frequencies in Hz
 volatile bool demo_mode = false;                                // Command 0x04: synthetic bench data
 volatile bool rpm_pin_test = false;                             // Command 0x05: diagnostic pin reports
+volatile bool rpm_interrupt_test = false;                       // Command 0x07: real-time interrupt logging
 
 // Microsecond tracking variables for independent scheduling on Core 0
 unsigned long last_tx_us[5]  = {0, 0, 0, 0, 0};
@@ -155,6 +156,14 @@ void printCurrentConfig() {
   Serial.println("\n--- CURRENT CONFIGURATION STATUS ---");
   Serial.print("Bench mode: "); Serial.println(demo_mode ? "ENABLED" : "DISABLED");
   Serial.print("RPM pin test: "); Serial.println(rpm_pin_test ? "ENABLED" : "DISABLED");
+  Serial.print("RPM interrupt test: "); Serial.println(rpm_interrupt_test ? "ENABLED" : "DISABLED");
+  
+  uint16_t primarySpokes = 1;
+  uint16_t secondarySpokes = 1;
+  RpmCounter::getSpokes(primarySpokes, secondarySpokes);
+  Serial.print("RPM Spokes - PRIMARY: "); Serial.print(primarySpokes);
+  Serial.print(" | SECONDARY: "); Serial.println(secondarySpokes);
+  
   for (int i = 0; i < 5; i++) {
     Serial.print("Channel ["); Serial.print(i); Serial.print("] ("); Serial.print(labels[i]); Serial.print("): ");
     Serial.print(cfg_write_en[i] ? "ENABLED" : "DISABLED");
@@ -207,6 +216,20 @@ void handleIncomingCommands() {
     if (cmd == 0x03) {
       // Command 3: Return text-dump overview profile
       printCurrentConfig();
+    } else if (cmd == 0x06) {
+      // Command 6: Set RPM spoke counts (channel 0 or 1, value is spoke count)
+      if (ch <= 1) {
+        RpmCounter::setSpokes(ch, combined_val);
+        Serial.print("RPM Spokes updated - Channel ");
+        Serial.print(ch == 0 ? "PRIMARY" : "SECONDARY");
+        Serial.print(": ");
+        Serial.println(combined_val);
+      }
+    } else if (cmd == 0x07) {
+      // Command 7: Toggle RPM interrupt test mode
+      rpm_interrupt_test = (combined_val == 1);
+      RpmCounter::setInterruptTestMode(rpm_interrupt_test);
+      Serial.println(rpm_interrupt_test ? "RPM INTERRUPT TEST ENABLED" : "RPM INTERRUPT TEST DISABLED");
     }
   }
 }
