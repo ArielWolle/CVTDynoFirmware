@@ -1,4 +1,6 @@
 #include <SPI.h>
+#include <string.h>
+#include <pico/time.h> // time_us_64()
 #include <RpmCounter.h>
 
 // --- PIN DEFINITIONS ---
@@ -18,10 +20,52 @@ const uint16_t RPM2_SPOKES = 12;
 #define ADS_REG_MUX    0x01
 
 // =========================================================================
+// SERIAL PROTOCOL v2
+// =========================================================================
+// Telemetry packet (17 bytes), sent independently per channel so each channel keeps its own
+// configurable rate (see cfg_freq[] below) -- e.g. torque can run much faster than RPM without
+// affecting RPM's cadence, and vice versa.
+//   [0]    0xAA  sync byte 0
+//   [1]    0x55  sync byte 1
+//   [2]    channel id (0..4)
+//   [3]    per-channel rolling sequence number (drop detection on the receiving end)
+//   [4..7] int32 value, little-endian
+//   [8..15] uint64 firmware capture timestamp (time_us_64()), little-endian --
+//           stamped at the moment the value was physically true (e.g. the RPM window's last
+//           used edge), not when this packet happened to be sent, so a receiver can rebuild an
+//           accurate per-channel timeline even though channels arrive at different rates.
+//   [16]   CRC-8 (poly 0x07, init 0x00) over bytes [2..15]
+#define TELEMETRY_SYNC0 0xAA
+#define TELEMETRY_SYNC1 0x55
+#define TELEMETRY_PACKET_LEN 17
+#define TELEMETRY_CRC_SPAN 14 // bytes [2..15]
+
+// Command packet (5 bytes) -- a leading sync byte lets the parser resync after any dropped or
+// corrupted byte instead of permanently misaligning every subsequent command.
+//   [0] 0xC0 sync
+//   [1] command id
+//   [2] channel
+//   [3] value high byte
+//   [4] value low byte
+#define COMMAND_SYNC 0xC0
+#define COMMAND_PACKET_LEN 5
+
+uint8_t crc8(const uint8_t* data, size_t len) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+// =========================================================================
 // RUNTIME LIVE CONFIGURATION BUFFER (Shared dynamically between cores)
 // =========================================================================
 volatile bool cfg_write_en[5] = {true, true, true, true, true}; // RPM1, RPM2, SHIFT, T1, T2
-volatile uint16_t cfg_freq[5] = {20, 20, 10, 50, 50};           // Frequencies in Hz
+volatile uint16_t cfg_freq[5] = {20, 20, 10, 50, 50};           // Frequencies in Hz, independent per channel
 volatile bool demo_mode = false;                                // Command 0x04: synthetic bench data
 volatile bool rpm_pin_test = false;                             // Command 0x05: diagnostic pin reports
 volatile bool rpm_interrupt_test = false;                       // Command 0x07: real-time interrupt logging
@@ -30,6 +74,7 @@ volatile bool rpm_count_test = false;                           // Command 0x08:
 // Microsecond tracking variables for independent scheduling on Core 0
 unsigned long last_tx_us[5]  = {0, 0, 0, 0, 0};
 volatile unsigned long intervals_us[5]; 
+uint8_t tx_seq[5] = {0, 0, 0, 0, 0};
 unsigned long last_rpm_pin_test_ms = 0;
 unsigned long last_rpm_count_test_ms = 0;
 unsigned long last_rpm_interrupt_test_ms = 0;
@@ -44,6 +89,14 @@ struct __attribute__((__packed__)) SensorPacket {
   uint16_t shift  = 0;       
   int32_t  torq1  = 0;       
   int32_t  torq2  = 0;       
+  // Per-channel capture timestamps: when each value was physically measured, independent of when
+  // it's read here or transmitted. RPM channels get this from RpmCounter (last edge used in the
+  // reciprocal-counting window); shift/torque get it at the moment they're read below.
+  uint64_t t_rpm1  = 0;
+  uint64_t t_rpm2  = 0;
+  uint64_t t_shift = 0;
+  uint64_t t_torq1 = 0;
+  uint64_t t_torq2 = 0;
 };
 
 volatile SensorPacket shared_data;
@@ -100,32 +153,51 @@ void loop1() {
   local_packet.shift = shared_data.shift;
   local_packet.torq1 = shared_data.torq1;
   local_packet.torq2 = shared_data.torq2;
+  local_packet.t_rpm1 = shared_data.t_rpm1;
+  local_packet.t_rpm2 = shared_data.t_rpm2;
+  local_packet.t_shift = shared_data.t_shift;
+  local_packet.t_torq1 = shared_data.t_torq1;
+  local_packet.t_torq2 = shared_data.t_torq2;
   interrupts();
 
   uint32_t measuredRpm1 = 0;
   uint32_t measuredRpm2 = 0;
-  const bool rpmReady = RpmCounter::update(measuredRpm1, measuredRpm2);
+  uint64_t rpm1CaptureUs = 0;
+  uint64_t rpm2CaptureUs = 0;
+  const bool rpmReady = RpmCounter::update(measuredRpm1, measuredRpm2, rpm1CaptureUs, rpm2CaptureUs);
 
   // Bench mode leaves the hardware setup intact but bypasses all sensor reads.
   // Disable it over serial to return to the real sensor path without reflashing.
   if (demo_mode) {
     const float phase = millis() / 1000.0f;
+    const uint64_t nowUs = time_us_64();
     local_packet.rpm1 = 4200 + (sin(phase) * 1100) + (phase * 18);
     local_packet.rpm2 = 2850 + (sin(phase - 0.55f) * 720) + (phase * 12);
     local_packet.shift = 1800 + (sin(phase * 0.45f) * 850);
     local_packet.torq1 = 420 + (sin(phase * 0.8f) * 105);
     local_packet.torq2 = 335 + (sin((phase * 0.8f) - 0.3f) * 88);
+    local_packet.t_rpm1 = nowUs;
+    local_packet.t_rpm2 = nowUs;
+    local_packet.t_shift = nowUs;
+    local_packet.t_torq1 = nowUs;
+    local_packet.t_torq2 = nowUs;
   } else {
     if (rpmReady) {
       local_packet.rpm1 = measuredRpm1;
       local_packet.rpm2 = measuredRpm2;
+      local_packet.t_rpm1 = rpm1CaptureUs;
+      local_packet.t_rpm2 = rpm2CaptureUs;
     }
 
     local_packet.shift = analogRead(PIN_SHIFT);
+    local_packet.t_shift = time_us_64();
 
     if (digitalRead(PIN_ADS_DRDY) == LOW) {
       local_packet.torq1 = readADS1256(0);
       local_packet.torq2 = readADS1256(1);
+      const uint64_t torqueUs = time_us_64();
+      local_packet.t_torq1 = torqueUs;
+      local_packet.t_torq2 = torqueUs;
     }
   }
 
@@ -135,6 +207,11 @@ void loop1() {
   shared_data.shift = local_packet.shift;
   shared_data.torq1 = local_packet.torq1;
   shared_data.torq2 = local_packet.torq2;
+  shared_data.t_rpm1  = local_packet.t_rpm1;
+  shared_data.t_rpm2  = local_packet.t_rpm2;
+  shared_data.t_shift = local_packet.t_shift;
+  shared_data.t_torq1 = local_packet.t_torq1;
+  shared_data.t_torq2 = local_packet.t_torq2;
   interrupts();
 }
 
@@ -219,54 +296,60 @@ void printRpmInterruptDiagnostics() {
 }
 
 void handleIncomingCommands() {
-  // Check if a full 4-byte command packet has fully loaded into the USB FIFO cache
-  if (Serial.available() >= 4) {
-    uint8_t cmd  = Serial.read();
-    uint8_t ch   = Serial.read();
-    uint8_t valH = Serial.read();
-    uint8_t valL = Serial.read();
-    uint16_t combined_val = ((uint16_t)valH << 8) | valL;
+  // Discard any bytes that aren't the command sync byte first, so a single dropped/corrupted byte
+  // can only cost the one malformed command instead of permanently misaligning every command
+  // parsed afterward (the previous fixed-4-byte parser had no way to recover from that).
+  while (Serial.available() > 0 && Serial.peek() != COMMAND_SYNC) {
+    Serial.read();
+  }
+  if (Serial.available() < COMMAND_PACKET_LEN) return;
 
-    if (cmd == 0x04) {
-      demo_mode = (combined_val == 1);
-      Serial.println(demo_mode ? "BENCH MODE ENABLED" : "BENCH MODE DISABLED");
-    } else if (cmd == 0x05) {
-      rpm_pin_test = (combined_val == 1);
-      Serial.println(rpm_pin_test ? "RPM PIN TEST ENABLED" : "RPM PIN TEST DISABLED");
-    } else if (ch <= 4) {
-      if (cmd == 0x01) { 
-        // Command 1: Toggle stream active states
-        cfg_write_en[ch] = (combined_val == 1);
-      } 
-      else if (cmd == 0x02) { 
-        // Command 2: Re-map target execution speeds
-        cfg_freq[ch] = combined_val;
-        updateIntervals();
-      }
+  Serial.read(); // consume sync byte
+  uint8_t cmd  = Serial.read();
+  uint8_t ch   = Serial.read();
+  uint8_t valH = Serial.read();
+  uint8_t valL = Serial.read();
+  uint16_t combined_val = ((uint16_t)valH << 8) | valL;
+
+  if (cmd == 0x04) {
+    demo_mode = (combined_val == 1);
+    Serial.println(demo_mode ? "BENCH MODE ENABLED" : "BENCH MODE DISABLED");
+  } else if (cmd == 0x05) {
+    rpm_pin_test = (combined_val == 1);
+    Serial.println(rpm_pin_test ? "RPM PIN TEST ENABLED" : "RPM PIN TEST DISABLED");
+  } else if (ch <= 4) {
+    if (cmd == 0x01) { 
+      // Command 1: Toggle stream active states
+      cfg_write_en[ch] = (combined_val == 1);
+    } 
+    else if (cmd == 0x02) { 
+      // Command 2: Re-map target execution speeds (independent per channel)
+      cfg_freq[ch] = combined_val;
+      updateIntervals();
     }
-    
-    if (cmd == 0x03) {
-      // Command 3: Return text-dump overview profile
-      printCurrentConfig();
-    } else if (cmd == 0x06) {
-      // Command 6: Set RPM spoke counts (channel 0 or 1, value is spoke count)
-      if (ch <= 1) {
-        RpmCounter::setSpokes(ch, combined_val);
-        Serial.print("RPM Spokes updated - Channel ");
-        Serial.print(ch == 0 ? "PRIMARY" : "SECONDARY");
-        Serial.print(": ");
-        Serial.println(combined_val);
-      }
-    } else if (cmd == 0x07) {
-      // Command 7: Toggle RPM interrupt test mode
-      rpm_interrupt_test = (combined_val == 1);
-      RpmCounter::setInterruptTestMode(rpm_interrupt_test);
-      Serial.println(rpm_interrupt_test ? "RPM INTERRUPT TEST ENABLED" : "RPM INTERRUPT TEST DISABLED");
-    } else if (cmd == 0x08) {
-      // Command 8: Toggle RPM count test mode
-      rpm_count_test = (combined_val == 1);
-      Serial.println(rpm_count_test ? "RPM COUNT TEST ENABLED" : "RPM COUNT TEST DISABLED");
+  }
+  
+  if (cmd == 0x03) {
+    // Command 3: Return text-dump overview profile
+    printCurrentConfig();
+  } else if (cmd == 0x06) {
+    // Command 6: Set RPM spoke counts (channel 0 or 1, value is spoke count)
+    if (ch <= 1) {
+      RpmCounter::setSpokes(ch, combined_val);
+      Serial.print("RPM Spokes updated - Channel ");
+      Serial.print(ch == 0 ? "PRIMARY" : "SECONDARY");
+      Serial.print(": ");
+      Serial.println(combined_val);
     }
+  } else if (cmd == 0x07) {
+    // Command 7: Toggle RPM interrupt test mode
+    rpm_interrupt_test = (combined_val == 1);
+    RpmCounter::setInterruptTestMode(rpm_interrupt_test);
+    Serial.println(rpm_interrupt_test ? "RPM INTERRUPT TEST ENABLED" : "RPM INTERRUPT TEST DISABLED");
+  } else if (cmd == 0x08) {
+    // Command 8: Toggle RPM count test mode
+    rpm_count_test = (combined_val == 1);
+    Serial.println(rpm_count_test ? "RPM COUNT TEST ENABLED" : "RPM COUNT TEST DISABLED");
   }
 }
 
@@ -278,6 +361,11 @@ void loop() {
   local_packet.shift = shared_data.shift;
   local_packet.torq1 = shared_data.torq1;
   local_packet.torq2 = shared_data.torq2;
+  local_packet.t_rpm1 = shared_data.t_rpm1;
+  local_packet.t_rpm2 = shared_data.t_rpm2;
+  local_packet.t_shift = shared_data.t_shift;
+  local_packet.t_torq1 = shared_data.t_torq1;
+  local_packet.t_torq2 = shared_data.t_torq2;
   interrupts();
   handleIncomingCommands();
 
@@ -297,49 +385,39 @@ void loop() {
   }
 
   unsigned long now = micros();
-  SensorPacket packet_to_send;
-  bool data_copied = false;
 
-  // Track if any enabled channel is ready to send
+  // Each enabled channel is scheduled and transmitted completely independently -- one channel
+  // running at a high rate (e.g. torque in the future) never throttles or is throttled by another
+  // channel's rate, since each has its own interval, own timestamp, and its own packet.
   for (int i = 0; i < 5; i++) {
     if (cfg_write_en[i] && (now - last_tx_us[i] >= intervals_us[i])) {
       last_tx_us[i] = now;
-      
-      if (!data_copied) {
-        noInterrupts();
-        packet_to_send.rpm1 = shared_data.rpm1;
-        packet_to_send.rpm2 = shared_data.rpm2;
-        packet_to_send.shift = shared_data.shift;
-        packet_to_send.torq1 = shared_data.torq1;
-        packet_to_send.torq2 = shared_data.torq2;
-        interrupts();
-        data_copied = true;
-      }
 
-      // To preserve structure parsing speed, instead of full structs, we send 
-      // individual small 8-byte typed packages containing specific item states
-      // Structure: [Header 0xAABB] [Channel ID] [Padding Byte] [4 Bytes Integer Data Payload]
-      uint16_t sync_head = 0xAABB;
-      uint8_t padding = 0x00;
       int32_t payload_val = 0;
+      uint64_t capture_us = 0;
 
-      switch(i) {
-        case 0: payload_val = (int32_t)packet_to_send.rpm1;  break;
-        case 1: payload_val = (int32_t)packet_to_send.rpm2;  break;
-        case 2: payload_val = (int32_t)packet_to_send.shift; break;
-        case 3: payload_val = (int32_t)packet_to_send.torq1; break;
-        case 4: payload_val = (int32_t)packet_to_send.torq2; break;
+      switch (i) {
+        case 0: payload_val = (int32_t)local_packet.rpm1;  capture_us = local_packet.t_rpm1;  break;
+        case 1: payload_val = (int32_t)local_packet.rpm2;  capture_us = local_packet.t_rpm2;  break;
+        case 2: payload_val = (int32_t)local_packet.shift; capture_us = local_packet.t_shift; break;
+        case 3: payload_val = (int32_t)local_packet.torq1; capture_us = local_packet.t_torq1; break;
+        case 4: payload_val = (int32_t)local_packet.torq2; capture_us = local_packet.t_torq2; break;
       }
 
-      Serial.write((uint8_t*)&sync_head, 2);
-      uint8_t channel = (uint8_t)i;
-      Serial.write(&channel, 1);
-      Serial.write(&padding, 1);
-      Serial.write((uint8_t*)&payload_val, 4);
+      uint8_t packet[TELEMETRY_PACKET_LEN];
+      packet[0] = TELEMETRY_SYNC0;
+      packet[1] = TELEMETRY_SYNC1;
+      packet[2] = (uint8_t)i;
+      packet[3] = tx_seq[i]++;
+      memcpy(&packet[4], &payload_val, 4);
+      memcpy(&packet[8], &capture_us, 8);
+      packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
+
+      Serial.write(packet, TELEMETRY_PACKET_LEN);
     }
   }
-  
-  if (data_copied) {
-    Serial.flush(); // Commit data out immediately if anything was queued
-  }
+  // No per-iteration Serial.flush(): on USB-CDC that blocks until the host has drained the
+  // buffer, adding needless latency/jitter to every loop iteration. Let the USB stack batch
+  // writes naturally -- at these data rates (well under 1% of USB-CDC's throughput) nothing is
+  // lost, it's just no longer forced out packet-by-packet.
 }

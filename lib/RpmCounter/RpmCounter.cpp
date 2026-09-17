@@ -1,16 +1,24 @@
 #include "RpmCounter.h"
 
 namespace {
+// --- Per-window edge accounting (reset every `update()` call) ---
 volatile uint32_t primaryPulses = 0;
 volatile uint32_t secondaryPulses = 0;
+volatile uint64_t primaryWindowFirstEdgeUs = 0;   // 0 == "no edge yet this window"
+volatile uint64_t secondaryWindowFirstEdgeUs = 0;
+volatile uint64_t primaryWindowLastEdgeUs = 0;
+volatile uint64_t secondaryWindowLastEdgeUs = 0;
+
+// --- Cross-window state (persists) ---
+volatile uint64_t primaryLastEdgeUs = 0;          // most recent edge ever, for staleness checks
+volatile uint64_t secondaryLastEdgeUs = 0;
+volatile uint32_t primaryRawPeriodUs = 0;         // most recent single inter-edge interval, unsmoothed
+volatile uint32_t secondaryRawPeriodUs = 0;
 volatile uint32_t primaryTotalEdges = 0;
 volatile uint32_t secondaryTotalEdges = 0;
 volatile uint32_t primaryInterruptEvents = 0;
 volatile uint32_t secondaryInterruptEvents = 0;
-volatile uint32_t primaryLastEdgeUs = 0;
-volatile uint32_t secondaryLastEdgeUs = 0;
-volatile uint32_t primaryPeriodUs = 0;
-volatile uint32_t secondaryPeriodUs = 0;
+
 uint8_t primaryPin = 0;
 uint8_t secondaryPin = 0;
 uint16_t primarySpokes = 1;
@@ -19,30 +27,56 @@ uint32_t windowMs = 50;
 uint32_t windowStartMs = 0;
 bool interruptTestMode = false;
 
-constexpr uint32_t RPM_STALE_TIMEOUT_US = 500000;
+// A stale reading (no edges for this long) reports 0 RPM instead of holding a frozen value.
+constexpr uint64_t RPM_STALE_TIMEOUT_US = 500000;
 
 void primaryEdge() {
-  const uint32_t nowUs = micros();
+  const uint64_t nowUs = time_us_64();
   if (primaryLastEdgeUs != 0) {
-    const uint32_t dt = nowUs - primaryLastEdgeUs;
-    primaryPeriodUs = primaryPeriodUs == 0 ? dt : (primaryPeriodUs * 3 + dt) / 4;
+    const uint64_t dt = nowUs - primaryLastEdgeUs;
+    primaryRawPeriodUs = (uint32_t)dt;
   }
   primaryLastEdgeUs = nowUs;
+  if (primaryWindowFirstEdgeUs == 0) primaryWindowFirstEdgeUs = nowUs;
+  primaryWindowLastEdgeUs = nowUs;
   primaryPulses++;
   primaryTotalEdges++;
   if (interruptTestMode) primaryInterruptEvents++;
 }
 
 void secondaryEdge() {
-  const uint32_t nowUs = micros();
+  const uint64_t nowUs = time_us_64();
   if (secondaryLastEdgeUs != 0) {
-    const uint32_t dt = nowUs - secondaryLastEdgeUs;
-    secondaryPeriodUs = secondaryPeriodUs == 0 ? dt : (secondaryPeriodUs * 3 + dt) / 4;
+    const uint64_t dt = nowUs - secondaryLastEdgeUs;
+    secondaryRawPeriodUs = (uint32_t)dt;
   }
   secondaryLastEdgeUs = nowUs;
+  if (secondaryWindowFirstEdgeUs == 0) secondaryWindowFirstEdgeUs = nowUs;
+  secondaryWindowLastEdgeUs = nowUs;
   secondaryPulses++;
   secondaryTotalEdges++;
   if (interruptTestMode) secondaryInterruptEvents++;
+}
+
+// Reciprocal-counting frequency measurement: given N edges spanning a known elapsed time, the
+// average period is elapsed / (N-1) -- exact and unbiased regardless of RPM, with no smoothing lag.
+// This replaces an older exponential moving average of single-edge periods, which systematically
+// lagged behind RPM during acceleration/deceleration (exactly the part of a dyno pull that
+// matters most). When too few edges land in a window to do reciprocal counting (very low RPM
+// relative to the window length), we fall back to the single most recent raw inter-edge period
+// with no smoothing applied, so the reported value is always the least-processed accurate number
+// available rather than a filtered/lagged one -- any desired smoothing is left to the app layer,
+// which can see the full raw stream and choose a window.
+uint32_t computeRpm(uint32_t edgeCount, uint64_t windowFirstUs, uint64_t windowLastUs, uint32_t rawPeriodUs, uint16_t spokes) {
+  if (edgeCount >= 2 && windowLastUs > windowFirstUs) {
+    const double elapsedUs = (double)(windowLastUs - windowFirstUs);
+    const double periodUs = elapsedUs / (double)(edgeCount - 1);
+    return (uint32_t)(60000000.0 / (periodUs * (double)spokes));
+  }
+  if (rawPeriodUs > 0) {
+    return (uint32_t)(60000000.0 / ((double)rawPeriodUs * (double)spokes));
+  }
+  return 0;
 }
 }
 
@@ -56,14 +90,18 @@ void begin(uint8_t newPrimaryPin, uint8_t newSecondaryPin, uint16_t newPrimarySp
   windowStartMs = millis();
   primaryPulses = 0;
   secondaryPulses = 0;
+  primaryWindowFirstEdgeUs = 0;
+  secondaryWindowFirstEdgeUs = 0;
+  primaryWindowLastEdgeUs = 0;
+  secondaryWindowLastEdgeUs = 0;
   primaryTotalEdges = 0;
   secondaryTotalEdges = 0;
   primaryInterruptEvents = 0;
   secondaryInterruptEvents = 0;
   primaryLastEdgeUs = 0;
   secondaryLastEdgeUs = 0;
-  primaryPeriodUs = 0;
-  secondaryPeriodUs = 0;
+  primaryRawPeriodUs = 0;
+  secondaryRawPeriodUs = 0;
 
   // Optoisolator outputs are normally open-collector/open-drain.
   pinMode(primaryPin, INPUT_PULLUP);
@@ -72,41 +110,40 @@ void begin(uint8_t newPrimaryPin, uint8_t newSecondaryPin, uint16_t newPrimarySp
   attachInterrupt(digitalPinToInterrupt(secondaryPin), secondaryEdge, RISING);
 }
 
-bool update(uint32_t& primaryRpm, uint32_t& secondaryRpm) {
+bool update(uint32_t& primaryRpm, uint32_t& secondaryRpm, uint64_t& primaryCaptureUs, uint64_t& secondaryCaptureUs) {
   const uint32_t nowMs = millis();
   const uint32_t elapsedMs = nowMs - windowStartMs;
   if (elapsedMs < windowMs) return false;
-  const uint32_t nowUs = micros();
+  const uint64_t nowUs = time_us_64();
 
   noInterrupts();
   const uint32_t primaryCount = primaryPulses;
   const uint32_t secondaryCount = secondaryPulses;
-  const uint32_t primaryLastUs = primaryLastEdgeUs;
-  const uint32_t secondaryLastUs = secondaryLastEdgeUs;
-  const uint32_t primaryDtUs = primaryPeriodUs;
-  const uint32_t secondaryDtUs = secondaryPeriodUs;
+  const uint64_t primaryFirstUs = primaryWindowFirstEdgeUs;
+  const uint64_t secondaryFirstUs = secondaryWindowFirstEdgeUs;
+  const uint64_t primaryLastUs = primaryWindowLastEdgeUs;
+  const uint64_t secondaryLastUs = secondaryWindowLastEdgeUs;
+  const uint64_t primaryLastEverUs = primaryLastEdgeUs;
+  const uint64_t secondaryLastEverUs = secondaryLastEdgeUs;
+  const uint32_t primaryRawUs = primaryRawPeriodUs;
+  const uint32_t secondaryRawUs = secondaryRawPeriodUs;
   primaryPulses = 0;
   secondaryPulses = 0;
+  primaryWindowFirstEdgeUs = 0;
+  secondaryWindowFirstEdgeUs = 0;
   interrupts();
 
-  const bool primaryRecent = primaryLastUs != 0 && (nowUs - primaryLastUs) <= RPM_STALE_TIMEOUT_US;
-  const bool secondaryRecent = secondaryLastUs != 0 && (nowUs - secondaryLastUs) <= RPM_STALE_TIMEOUT_US;
+  const bool primaryRecent = primaryLastEverUs != 0 && (nowUs - primaryLastEverUs) <= RPM_STALE_TIMEOUT_US;
+  const bool secondaryRecent = secondaryLastEverUs != 0 && (nowUs - secondaryLastEverUs) <= RPM_STALE_TIMEOUT_US;
 
-  if (primaryRecent && primaryDtUs > 0) {
-    primaryRpm = (uint32_t)(60000000.0 / ((double)primaryDtUs * (double)primarySpokes));
-  } else {
-    primaryRpm = primaryCount > 0
-      ? (uint32_t)(((double)primaryCount * 60000.0) / ((double)elapsedMs * (double)primarySpokes))
-      : 0;
-  }
+  primaryRpm = primaryRecent ? computeRpm(primaryCount, primaryFirstUs, primaryLastUs, primaryRawUs, primarySpokes) : 0;
+  secondaryRpm = secondaryRecent ? computeRpm(secondaryCount, secondaryFirstUs, secondaryLastUs, secondaryRawUs, secondarySpokes) : 0;
 
-  if (secondaryRecent && secondaryDtUs > 0) {
-    secondaryRpm = (uint32_t)(60000000.0 / ((double)secondaryDtUs * (double)secondarySpokes));
-  } else {
-    secondaryRpm = secondaryCount > 0
-      ? (uint32_t)(((double)secondaryCount * 60000.0) / ((double)elapsedMs * (double)secondarySpokes))
-      : 0;
-  }
+  // Stamp the capture time as the last edge actually used in the measurement (or "now" for a
+  // stale/zero reading) so the value is timestamped when it was physically true, not when this
+  // polling function happened to run.
+  primaryCaptureUs = primaryRecent ? (primaryCount >= 1 ? primaryLastUs : primaryLastEverUs) : nowUs;
+  secondaryCaptureUs = secondaryRecent ? (secondaryCount >= 1 ? secondaryLastUs : secondaryLastEverUs) : nowUs;
 
   windowStartMs = nowMs;
   return true;
