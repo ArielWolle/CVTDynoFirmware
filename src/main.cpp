@@ -303,15 +303,38 @@ void loop1() {
     local_packet.t_torq1 = nowUs;
     local_packet.t_torq2 = nowUs;
   } else {
-    local_packet.shift = analogRead(PIN_SHIFT);
-    local_packet.t_shift = time_us_64();
+    // Real sensor reads used to run completely unconditionally here -- analogRead(PIN_SHIFT) on
+    // every single loop1() iteration (as fast as core1 could spin, regardless of whether shift was
+    // even enabled or what rate it was configured to send at) and the ADS1256/SPI torque read
+    // whenever DRDY happened to be ready, again regardless of cfg_write_en[]. Besides being wasted
+    // work when a channel is disabled, continuous unthrottled ADC/SPI bus activity is a plausible
+    // contributor to the electrical noise observed live on the physically-nearby RPM1 input (see
+    // MIN_VALID_PERIOD_US in RpmCounter.cpp) -- these reads now only happen when their channel is
+    // actually enabled, and no faster than intervals_us[] (the same per-channel rate cfg_freq[]
+    // already drives on the TX side in loop()), instead of firing at whatever rate the loop
+    // happens to spin or DRDY happens to toggle.
+    static unsigned long last_shift_read_us = 0;
+    static unsigned long last_torque_read_us = 0;
+    const unsigned long nowUsCore1 = micros();
 
-    if (digitalRead(PIN_ADS_DRDY) == LOW) {
-      local_packet.torq1 = readADS1256(0);
-      local_packet.torq2 = readADS1256(1);
+    if (cfg_write_en[2] && (nowUsCore1 - last_shift_read_us >= intervals_us[2])) {
+      last_shift_read_us = nowUsCore1;
+      local_packet.shift = analogRead(PIN_SHIFT);
+      local_packet.t_shift = time_us_64();
+    }
+
+    // Both torque channels share one physical ADS1256 conversion/SPI transaction, so they're
+    // gated together at whichever enabled channel wants the faster rate -- reading at a rate
+    // neither enabled channel actually wants transmitted would be pure wasted SPI bus activity.
+    const bool torqueWanted = cfg_write_en[3] || cfg_write_en[4];
+    const unsigned long torqueIntervalUs = !cfg_write_en[3] ? intervals_us[4]
+                                          : !cfg_write_en[4] ? intervals_us[3]
+                                          : min(intervals_us[3], intervals_us[4]);
+    if (torqueWanted && (nowUsCore1 - last_torque_read_us >= torqueIntervalUs) && digitalRead(PIN_ADS_DRDY) == LOW) {
+      last_torque_read_us = nowUsCore1;
       const uint64_t torqueUs = time_us_64();
-      local_packet.t_torq1 = torqueUs;
-      local_packet.t_torq2 = torqueUs;
+      if (cfg_write_en[3]) { local_packet.torq1 = readADS1256(0); local_packet.t_torq1 = torqueUs; }
+      if (cfg_write_en[4]) { local_packet.torq2 = readADS1256(1); local_packet.t_torq2 = torqueUs; }
     }
   }
 
@@ -448,14 +471,23 @@ void printRpmCountDiagnostics() {
   // channel's ring fast enough) -- should be 0 under normal operation; see RpmCounter::popEdge().
   const uint32_t primaryDropped = RpmCounter::readAndClearDropped(0);
   const uint32_t secondaryDropped = RpmCounter::readAndClearDropped(1);
+  // Rejected counts surface implausibly-fast pulses being filtered out (see MIN_VALID_PERIOD_US in
+  // RpmCounter.cpp) -- should be 0 with a real sensor under normal operation; a sustained nonzero
+  // count here means something is inducing noise on that channel's input pin.
+  const uint32_t primaryRejected = RpmCounter::readAndClearRejectedNoise(0);
+  const uint32_t secondaryRejected = RpmCounter::readAndClearRejectedNoise(1);
   usb_web.print("RPM COUNT TEST | RPM1 count=");
   usb_web.print(primaryCount);
   usb_web.print(" dropped=");
   usb_web.print(primaryDropped);
+  usb_web.print(" rejected=");
+  usb_web.print(primaryRejected);
   usb_web.print(" | RPM2 count=");
   usb_web.print(secondaryCount);
   usb_web.print(" dropped=");
-  usb_web.println(secondaryDropped);
+  usb_web.print(secondaryDropped);
+  usb_web.print(" rejected=");
+  usb_web.println(secondaryRejected);
   usb_web.flush(); // see printCurrentConfig()'s flush() comment -- same reasoning applies here
 }
 

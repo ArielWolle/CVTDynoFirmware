@@ -27,6 +27,27 @@ struct EdgeEvent {
 // forever once the wheel stops turning.
 constexpr uint64_t RPM_STALE_TIMEOUT_US = 500000;
 
+// A real tooth edge should never arrive faster than this after the previous one on the SAME
+// channel -- guards against electrical noise/crosstalk on the input pin being misinterpreted as
+// legitimate tooth data. Confirmed live on real hardware with no sensor connected: a sustained
+// ~13,500 Hz noise burst on PIN_RPM1 (periods as low as 74us), coinciding with continuous
+// ADS1256/SPI bus activity on the same board -- indistinguishable from real edges to the ISR
+// without a check like this, and fast enough to flood the whole downstream pipeline (firmware TX
+// bandwidth and the viewer's processing) with spurious telemetry. 200us (5,000 Hz / a period
+// product of 300,000 RPM*teeth) is chosen comfortably below this while staying comfortably above
+// demo mode's fastest legitimate period (~647us at its current bounds -- see
+// injectDemoRpmEdges()'s demoRpm1/DEMO_RPM1_TEETH), so it can never reject real demo/sensor data
+// for any physically reasonable primary/secondary pulley speed and tooth count.
+//
+// Note this reduces a sustained, dense noise burst by roughly two orders of magnitude rather than
+// eliminating it outright: a rejected edge intentionally does NOT advance lastEdgeUs (see
+// recordEdge() below), so once enough rejected edges accumulate that the elapsed time since the
+// last ACCEPTED edge exceeds this threshold, the next one slips through as if it were a real,
+// slower edge. If noise persists even with this filter in place, the real fix is hardware --
+// shielding/routing on PIN_RPM1/PIN_RPM2, or an RC low-pass filter -- this is a software
+// mitigation, not a substitute for that.
+constexpr uint32_t MIN_VALID_PERIOD_US = 200;
+
 struct RpmChannelState {
   EdgeEvent ring[EVENT_RING_SIZE] = {};
   volatile uint32_t head = 0;    // next slot the producer will write (producer-owned)
@@ -43,6 +64,7 @@ struct RpmChannelState {
   volatile uint32_t totalEdges = 0;
   volatile uint32_t interruptEvents = 0;
   volatile uint32_t diagPulses = 0;
+  volatile uint32_t rejectedNoise = 0; // edges rejected by MIN_VALID_PERIOD_US below
 };
 
 RpmChannelState primaryState;
@@ -77,6 +99,14 @@ void recordEdge(RpmChannelState& s) {
   const uint64_t nowUs = time_us_64();
   const bool havePrior = s.lastEdgeUs != 0;
   const uint32_t periodUs = havePrior ? (uint32_t)(nowUs - s.lastEdgeUs) : 0;
+  // See MIN_VALID_PERIOD_US above -- deliberately does NOT touch lastEdgeUs/reportedStale/counters
+  // on rejection, so the next genuinely-spaced edge is still timed against the last REAL edge (not
+  // a noise pulse), and a burst of noise can never itself count as "the channel is active" for
+  // staleness or diagnostic purposes.
+  if (havePrior && periodUs < MIN_VALID_PERIOD_US) {
+    s.rejectedNoise++;
+    return;
+  }
   s.lastEdgeUs = nowUs;
   s.reportedStale = false; // a real edge always clears any prior "stopped" report
   if (havePrior) pushEdge(s, nowUs, periodUs);
@@ -161,6 +191,15 @@ uint32_t readAndClearDropped(uint8_t channel) {
   s.dropped = 0;
   interrupts();
   return d;
+}
+
+uint32_t readAndClearRejectedNoise(uint8_t channel) {
+  RpmChannelState& s = (channel == 0) ? primaryState : secondaryState;
+  noInterrupts();
+  const uint32_t n = s.rejectedNoise;
+  s.rejectedNoise = 0;
+  interrupts();
+  return n;
 }
 
 void readDiagnostics(uint32_t& primaryEdges, uint32_t& secondaryEdges) {

@@ -44,6 +44,12 @@ void injectSyntheticEdge(uint8_t channel, uint32_t periodUs);
 // a real backlog is visible instead of silently invisible.
 uint32_t readAndClearDropped(uint8_t channel);
 
+// Read-and-clear count of edges rejected as implausible noise (see MIN_VALID_PERIOD_US in the
+// .cpp) -- a nonzero, sustained count here means something is inducing spurious fast pulses on
+// that channel's input pin, worth investigating even though the filter is already keeping them off
+// the wire.
+uint32_t readAndClearRejectedNoise(uint8_t channel);
+
 void readDiagnostics(uint32_t& primaryEdges, uint32_t& secondaryEdges);
 // Read-and-clear edge counters intended for periodic (e.g. 100ms) diagnostic polling -- reports
 // edges seen since the last call, not a fixed measurement window.
