@@ -15,10 +15,14 @@ const int PIN_ADS_DRDY = 20;
 const int PIN_ADS_RST  = 21; 
 const int PIN_FULL_THROTTLE = 0; // Binary input, pulled up; grounded (LOW) = full throttle
 
-// Number of optoisolator pulses generated per wheel revolution.
-// Set these to the physical spoke count for each RPM wheel.
-const uint16_t RPM1_SPOKES = 16;
-const uint16_t RPM2_SPOKES = 12;
+// Bench/demo-mode only: synthetic tooth counts used purely to generate a realistic per-tooth
+// cadence for the sine-wave demo RPM signal (see loop1()'s demo_mode branch). The real hardware
+// path does NOT use a spoke/tooth count on-device at all -- RPM channels stream a raw inter-edge
+// period per physical tooth (see RpmCounter::popEdge()), and reconstructing RPM from that period
+// (rpm = 60e6 / (period_us * spokes)) is entirely a host-side concern, so a spoke-count change
+// never needs a firmware round-trip.
+const uint16_t DEMO_RPM1_TEETH = 16;
+const uint16_t DEMO_RPM2_TEETH = 12;
 
 #define ADS_CMD_RDATA  0x01
 #define ADS_REG_MUX    0x01
@@ -39,22 +43,31 @@ Adafruit_USBD_WebUSB usb_web;
 // CDC-based design and read/written the same way, just over `usb_web` (a Stream, like Serial was)
 // instead of `Serial`.
 //
-// Telemetry packet (17 bytes), sent independently per channel so each channel keeps its own
-// configurable rate (see cfg_freq[] below) -- e.g. torque can run much faster than RPM without
-// affecting RPM's cadence, and vice versa.
+// Telemetry packet (17 bytes). Channels 2-4 (shift/torque) are sent on their own configurable
+// polling rate (see cfg_freq[] below) -- e.g. torque can run much faster than shift without
+// affecting shift's cadence, and vice versa. Channels 0-1 (RPM1/RPM2) are edge-triggered instead
+// of polled: one packet is sent per physical tooth as soon as it's detected, with NO fixed rate --
+// cfg_freq[0]/cfg_freq[1] have no effect (see the comment on cfg_freq[] below).
 //   [0]    0xAA  sync byte 0
 //   [1]    0x55  sync byte 1
 //   [2]    channel id (0..5)
 //   [3]    per-channel rolling sequence number (drop detection on the receiving end)
-//   [4..7] int32 value, little-endian
+//   [4..7] int32 value, little-endian --
+//           for channels 0-1 (RPM1/RPM2) this is the raw inter-edge period in microseconds since
+//           the previous tooth on that channel, NOT an RPM value. 0 means "no previous edge to
+//           compare against" (first edge since boot, or first edge after a gap) and should be
+//           treated as a reset/discontinuity marker rather than an actual zero-length period. The
+//           host reconstructs RPM itself: rpm = 60,000,000 / (period_us * teeth_per_revolution),
+//           since spoke/tooth count is a host-side display concern, not firmware state.
+//           for channels 2-4 (shift/torque) this is the polled sensor value, unchanged.
 //   [8..15] uint64 firmware capture timestamp (time_us_64()), little-endian --
-//           stamped at the moment the value was physically true (e.g. the last RPM edge used in
-//           its reciprocal-counting span), not when this packet happened to be sent, so a receiver
-//           can rebuild an accurate per-channel timeline even though channels arrive at different
-//           rates.
+//           stamped at the moment the value was physically true (the exact tooth-edge timestamp
+//           for RPM channels, or the moment read for shift/torque), not when this packet happened
+//           to be sent, so a receiver can rebuild an accurate per-channel timeline even though
+//           channels arrive at different rates.
 //   [16]   CRC-8 (poly 0x07, init 0x00) over bytes [2..15]
 //
-// Channel 5 (full throttle) is a binary input reported purely on change, not on a schedule --
+// Channel 5 (full throttle) is also a binary input reported purely on change, not on a schedule --
 // it has no entry in cfg_write_en[]/cfg_freq[] (there is no "rate" to configure) and is instead
 // pushed immediately whenever the pin transitions, so the receiver sees the exact moment it
 // happened rather than waiting for the next poll.
@@ -71,6 +84,11 @@ Adafruit_USBD_WebUSB usb_web;
 //   [2] channel
 //   [3] value high byte
 //   [4] value low byte
+//
+// Command IDs 0x06 (set RPM spoke count) and 0x09 (set RPM edges-per-update) are RESERVED/removed
+// -- both were device-side RPM computation knobs that no longer apply now that RPM channels stream
+// a raw per-tooth period and the host does all RPM reconstruction/smoothing (see the telemetry
+// packet comment above). Sending them is a no-op (unrecognized command id, silently ignored).
 #define COMMAND_SYNC 0xC0
 #define COMMAND_PACKET_LEN 5
 
@@ -89,7 +107,11 @@ uint8_t crc8(const uint8_t* data, size_t len) {
 // RUNTIME LIVE CONFIGURATION BUFFER (Shared dynamically between cores)
 // =========================================================================
 volatile bool cfg_write_en[5] = {true, true, true, true, true}; // RPM1, RPM2, SHIFT, T1, T2
-volatile uint16_t cfg_freq[5] = {20, 20, 10, 50, 50};           // Frequencies in Hz, independent per channel
+// Frequencies in Hz, independent per channel -- but cfg_freq[0]/cfg_freq[1] (RPM1/RPM2) are
+// vestigial: still settable via command 0x02 for wire compatibility, but have no effect, since RPM
+// channels stream one packet per physical tooth (edge-triggered) rather than being polled at a
+// configured rate. Only indices 2-4 (SHIFT, T1, T2) actually drive scheduling in loop() below.
+volatile uint16_t cfg_freq[5] = {0, 0, 10, 50, 50};
 volatile bool demo_mode = false;                                // Command 0x04: synthetic bench data
 volatile bool rpm_pin_test = false;                             // Command 0x05: diagnostic pin reports
 volatile bool rpm_interrupt_test = false;                       // Command 0x07: real-time interrupt logging
@@ -103,15 +125,9 @@ unsigned long last_rpm_pin_test_ms = 0;
 unsigned long last_rpm_count_test_ms = 0;
 unsigned long last_rpm_interrupt_test_ms = 0;
 
-// --- Persisted config load/apply handshake between setup()/loop() (core0) and setup1() (core1) --
-// RPM spoke counts live inside RpmCounter, which is only initialized once setup1() runs on core1;
-// applying a loaded value before that would just get overwritten by RpmCounter::begin()'s defaults.
-// setup1() flips core1_setup_done once it's safe, and loop() applies any loaded spokes exactly once
-// after that, rather than assuming a fixed boot ordering between the two cores.
-volatile bool core1_setup_done = false;
-bool loaded_rpm_spokes_have_value = false;
-uint16_t loaded_rpm1_spokes = 1;
-uint16_t loaded_rpm2_spokes = 1;
+// Tracked purely for the "Persisted config" line in printCurrentConfig() -- true if a valid
+// previously-saved configuration was found in flash at boot (see ConfigStore::load()).
+bool config_loaded_from_flash = false;
 
 // --- Full throttle input (channel 5) -------------------------------------------------------
 // Reported purely on change via interrupt, with no polling rate to configure. The ISR only
@@ -139,18 +155,19 @@ void fullThrottleChange() {
 // =========================================================================
 // SENSOR DATA TYPES & BUFFERING
 // =========================================================================
+// RPM (channels 0/1) is intentionally NOT part of this struct -- it no longer flows through a
+// polled shared_data snapshot at all. Real RPM edges go straight from the pin ISR into
+// RpmCounter's per-channel ring buffers (see RpmCounter::popEdge()), which loop() (core0) drains
+// and transmits directly, decoupled from this core1->core0 polling handoff entirely. This also
+// removes a hazard the old design had: a single-slot rpm1/rpm2 here could only ever hold the most
+// recent value, silently overwriting/losing any edge that landed between loop1() iterations.
 struct __attribute__((__packed__)) SensorPacket {
   uint16_t header = 0xAABB;  
-  uint16_t rpm1   = 0;       
-  uint16_t rpm2   = 0;       
   uint16_t shift  = 0;       
   int32_t  torq1  = 0;       
   int32_t  torq2  = 0;       
   // Per-channel capture timestamps: when each value was physically measured, independent of when
-  // it's read here or transmitted. RPM channels get this from RpmCounter (last edge used in the
-  // reciprocal-counting window); shift/torque get it at the moment they're read below.
-  uint64_t t_rpm1  = 0;
-  uint64_t t_rpm2  = 0;
+  // it's read here or transmitted.
   uint64_t t_shift = 0;
   uint64_t t_torq1 = 0;
   uint64_t t_torq2 = 0;
@@ -171,7 +188,7 @@ void setup1() {
   pinMode(PIN_RPM1, INPUT_PULLUP);
   pinMode(PIN_RPM2, INPUT_PULLUP);
   
-  RpmCounter::begin(PIN_RPM1, PIN_RPM2, RPM1_SPOKES, RPM2_SPOKES);
+  RpmCounter::begin(PIN_RPM1, PIN_RPM2);
 
   pinMode(PIN_ADS_CS, OUTPUT);
   pinMode(PIN_ADS_RST, OUTPUT);
@@ -180,10 +197,6 @@ void setup1() {
   digitalWrite(PIN_ADS_RST, HIGH);
   delay(10);
   SPI.begin();
-
-  // Signal loop() (core0) that RpmCounter::begin() has finished setting its compiled-in defaults,
-  // so it's now safe to overwrite them with any persisted spoke counts.
-  core1_setup_done = true;
 }
 
 int32_t readADS1256(uint8_t channel) {
@@ -206,56 +219,59 @@ int32_t readADS1256(uint8_t channel) {
   return regData;
 }
 
+// Demo-mode-only synthetic tooth generator (bench testing without real hardware). Injects
+// synthetic edges through the exact same RpmCounter ring buffer real edges use, gated by elapsed
+// time so it authentically produces one edge every `periodUs` rather than flooding the ring at
+// loop1()'s full iteration rate. State is core1-only (loop1() never runs anywhere else), so no
+// locking is needed here.
+void injectDemoRpmEdges(float phase) {
+  static uint64_t lastDemoEdgeUs[2] = {0, 0};
+  const uint64_t nowUs = time_us_64();
+
+  const float demoRpm1 = 4200 + (sin(phase) * 1100) + (phase * 18);
+  const float demoRpm2 = 2850 + (sin(phase - 0.55f) * 720) + (phase * 12);
+  // One "tooth" every 60e6 / (rpm * teeth) us -- mirrors the real reciprocal-counting relationship
+  // (see the telemetry packet comment on channels 0/1) so demo mode exercises a realistic cadence.
+  const uint32_t periodUs1 = (demoRpm1 > 0) ? (uint32_t)(60000000.0f / (demoRpm1 * DEMO_RPM1_TEETH)) : 0;
+  const uint32_t periodUs2 = (demoRpm2 > 0) ? (uint32_t)(60000000.0f / (demoRpm2 * DEMO_RPM2_TEETH)) : 0;
+
+  if (periodUs1 > 0 && (nowUs - lastDemoEdgeUs[0]) >= periodUs1) {
+    RpmCounter::injectSyntheticEdge(0, periodUs1);
+    lastDemoEdgeUs[0] = nowUs;
+  }
+  if (periodUs2 > 0 && (nowUs - lastDemoEdgeUs[1]) >= periodUs2) {
+    RpmCounter::injectSyntheticEdge(1, periodUs2);
+    lastDemoEdgeUs[1] = nowUs;
+  }
+}
+
 void loop1() {
   SensorPacket local_packet;
   noInterrupts();
-  local_packet.rpm1 = shared_data.rpm1;
-  local_packet.rpm2 = shared_data.rpm2;
   local_packet.shift = shared_data.shift;
   local_packet.torq1 = shared_data.torq1;
   local_packet.torq2 = shared_data.torq2;
-  local_packet.t_rpm1 = shared_data.t_rpm1;
-  local_packet.t_rpm2 = shared_data.t_rpm2;
   local_packet.t_shift = shared_data.t_shift;
   local_packet.t_torq1 = shared_data.t_torq1;
   local_packet.t_torq2 = shared_data.t_torq2;
   interrupts();
 
-  uint32_t measuredRpm1 = 0;
-  uint32_t measuredRpm2 = 0;
-  uint64_t rpm1CaptureUs = 0;
-  uint64_t rpm2CaptureUs = 0;
-  bool rpm1Ready = false;
-  bool rpm2Ready = false;
-  RpmCounter::update(measuredRpm1, measuredRpm2, rpm1CaptureUs, rpm2CaptureUs, rpm1Ready, rpm2Ready);
-
-  // Bench mode leaves the hardware setup intact but bypasses all sensor reads.
-  // Disable it over USB to return to the real sensor path without reflashing.
+  // Bench mode leaves the hardware setup intact but bypasses all sensor reads. RPM is NOT
+  // computed/gated here at all anymore (real or demo) -- real edges flow ISR-straight into
+  // RpmCounter's ring buffers, and demo edges are injected into the exact same rings by
+  // injectDemoRpmEdges() below, so both paths are drained identically by loop() on core0.
+  // Disable demo mode over USB to return to the real sensor path without reflashing.
   if (demo_mode) {
     const float phase = millis() / 1000.0f;
     const uint64_t nowUs = time_us_64();
-    local_packet.rpm1 = 4200 + (sin(phase) * 1100) + (phase * 18);
-    local_packet.rpm2 = 2850 + (sin(phase - 0.55f) * 720) + (phase * 12);
+    injectDemoRpmEdges(phase);
     local_packet.shift = 1800 + (sin(phase * 0.45f) * 850);
     local_packet.torq1 = 420 + (sin(phase * 0.8f) * 105);
     local_packet.torq2 = 335 + (sin((phase * 0.8f) - 0.3f) * 88);
-    local_packet.t_rpm1 = nowUs;
-    local_packet.t_rpm2 = nowUs;
     local_packet.t_shift = nowUs;
     local_packet.t_torq1 = nowUs;
     local_packet.t_torq2 = nowUs;
   } else {
-    // RPM1/RPM2 are independently edge-triggered (see RpmCounter) -- each is only overwritten
-    // here when its own channel actually produced a fresh reading, never gated by the other.
-    if (rpm1Ready) {
-      local_packet.rpm1 = measuredRpm1;
-      local_packet.t_rpm1 = rpm1CaptureUs;
-    }
-    if (rpm2Ready) {
-      local_packet.rpm2 = measuredRpm2;
-      local_packet.t_rpm2 = rpm2CaptureUs;
-    }
-
     local_packet.shift = analogRead(PIN_SHIFT);
     local_packet.t_shift = time_us_64();
 
@@ -269,13 +285,9 @@ void loop1() {
   }
 
   noInterrupts();
-  shared_data.rpm1  = local_packet.rpm1;
-  shared_data.rpm2  = local_packet.rpm2;
   shared_data.shift = local_packet.shift;
   shared_data.torq1 = local_packet.torq1;
   shared_data.torq2 = local_packet.torq2;
-  shared_data.t_rpm1  = local_packet.t_rpm1;
-  shared_data.t_rpm2  = local_packet.t_rpm2;
   shared_data.t_shift = local_packet.t_shift;
   shared_data.t_torq1 = local_packet.t_torq1;
   shared_data.t_torq2 = local_packet.t_torq2;
@@ -287,9 +299,8 @@ void loop1() {
 // =========================================================================
 void setup() {
   // Load any previously-saved config before anything else needs it. write_en[]/freq[] are owned
-  // by core0 and can be applied immediately; RPM spoke counts belong to RpmCounter on core1 and
-  // are staged in loaded_rpm*_spokes for loop() to apply once setup1() confirms it's ready (see
-  // core1_setup_done above).
+  // by core0 and can be applied immediately -- unlike before, there's no RPM-spoke handshake with
+  // core1 to stage anymore, since spoke count no longer lives on-device at all (see ConfigStore.h).
   ConfigStore::begin();
   ConfigStore::RuntimeConfig loadedConfig;
   if (ConfigStore::load(loadedConfig)) {
@@ -297,9 +308,7 @@ void setup() {
       cfg_write_en[i] = loadedConfig.write_en[i];
       cfg_freq[i] = loadedConfig.freq[i];
     }
-    loaded_rpm1_spokes = loadedConfig.rpm1_spokes;
-    loaded_rpm2_spokes = loadedConfig.rpm2_spokes;
-    loaded_rpm_spokes_have_value = true;
+    config_loaded_from_flash = true;
   }
 
   // Bring up the vendor-class WebUSB interface. Deliberately no Serial.begin() anywhere in this
@@ -351,19 +360,7 @@ void printCurrentConfig() {
   usb_web.print("RPM pin test: "); usb_web.println(rpm_pin_test ? "ENABLED" : "DISABLED");
   usb_web.print("RPM interrupt test: "); usb_web.println(rpm_interrupt_test ? "ENABLED" : "DISABLED");
   usb_web.print("RPM count test: "); usb_web.println(rpm_count_test ? "ENABLED" : "DISABLED");
-  
-  uint16_t primarySpokes = 1;
-  uint16_t secondarySpokes = 1;
-  RpmCounter::getSpokes(primarySpokes, secondarySpokes);
-  usb_web.print("RPM Spokes - PRIMARY: "); usb_web.print(primarySpokes);
-  usb_web.print(" | SECONDARY: "); usb_web.println(secondarySpokes);
-
-  uint16_t primaryEdgesPerUpdate = 1;
-  uint16_t secondaryEdgesPerUpdate = 1;
-  RpmCounter::getEdgesPerUpdate(primaryEdgesPerUpdate, secondaryEdgesPerUpdate);
-  usb_web.print("RPM Edges/Update - PRIMARY: "); usb_web.print(primaryEdgesPerUpdate);
-  usb_web.print(" | SECONDARY: "); usb_web.println(secondaryEdgesPerUpdate);
-  usb_web.print("Persisted config: "); usb_web.println(loaded_rpm_spokes_have_value ? "LOADED FROM FLASH" : "DEFAULTS (no valid saved config found)");
+  usb_web.print("Persisted config: "); usb_web.println(config_loaded_from_flash ? "LOADED FROM FLASH" : "DEFAULTS (no valid saved config found)");
   usb_web.print("Full throttle input: "); usb_web.println((digitalRead(PIN_FULL_THROTTLE) == LOW) ? "FULL THROTTLE" : "NOT FULL THROTTLE");
   
   for (int i = 0; i < 5; i++) {
@@ -392,10 +389,18 @@ void printRpmCountDiagnostics() {
   uint32_t primaryCount = 0;
   uint32_t secondaryCount = 0;
   RpmCounter::readWindowCounts(primaryCount, secondaryCount);
+  // Dropped counts surface a real per-tooth streaming backlog (the USB side wasn't draining a
+  // channel's ring fast enough) -- should be 0 under normal operation; see RpmCounter::popEdge().
+  const uint32_t primaryDropped = RpmCounter::readAndClearDropped(0);
+  const uint32_t secondaryDropped = RpmCounter::readAndClearDropped(1);
   usb_web.print("RPM COUNT TEST | RPM1 count=");
   usb_web.print(primaryCount);
+  usb_web.print(" dropped=");
+  usb_web.print(primaryDropped);
   usb_web.print(" | RPM2 count=");
-  usb_web.println(secondaryCount);
+  usb_web.print(secondaryCount);
+  usb_web.print(" dropped=");
+  usb_web.println(secondaryDropped);
 }
 
 void printRpmInterruptDiagnostics() {
@@ -445,15 +450,6 @@ void handleIncomingCommands() {
   if (cmd == 0x03) {
     // Command 3: Return text-dump overview profile
     printCurrentConfig();
-  } else if (cmd == 0x06) {
-    // Command 6: Set RPM spoke counts (channel 0 or 1, value is spoke count)
-    if (ch <= 1) {
-      RpmCounter::setSpokes(ch, combined_val);
-      usb_web.print("RPM Spokes updated - Channel ");
-      usb_web.print(ch == 0 ? "PRIMARY" : "SECONDARY");
-      usb_web.print(": ");
-      usb_web.println(combined_val);
-    }
   } else if (cmd == 0x07) {
     // Command 7: Toggle RPM interrupt test mode
     rpm_interrupt_test = (combined_val == 1);
@@ -463,47 +459,22 @@ void handleIncomingCommands() {
     // Command 8: Toggle RPM count test mode
     rpm_count_test = (combined_val == 1);
     usb_web.println(rpm_count_test ? "RPM COUNT TEST ENABLED" : "RPM COUNT TEST DISABLED");
-  } else if (cmd == 0x09) {
-    // Command 9: Set RPM edges-per-update (channel 0 or 1, value is edge count spanned per
-    // reciprocal-counting computation). 1 = recompute on every edge (fastest, default); higher
-    // values trade update latency for immunity to tooth-spacing manufacturing tolerance.
-    if (ch <= 1) {
-      RpmCounter::setEdgesPerUpdate(ch, combined_val);
-      usb_web.print("RPM Edges/Update updated - Channel ");
-      usb_web.print(ch == 0 ? "PRIMARY" : "SECONDARY");
-      usb_web.print(": ");
-      usb_web.println(combined_val);
-    }
   }
+  // Command IDs 0x06 and 0x09 are reserved/removed (see COMMAND_SYNC comment above) -- any other
+  // unrecognized cmd value is silently ignored, same as before.
 }
 
 void loop() {
   SensorPacket local_packet;
   noInterrupts();
-  local_packet.rpm1 = shared_data.rpm1;
-  local_packet.rpm2 = shared_data.rpm2;
   local_packet.shift = shared_data.shift;
   local_packet.torq1 = shared_data.torq1;
   local_packet.torq2 = shared_data.torq2;
-  local_packet.t_rpm1 = shared_data.t_rpm1;
-  local_packet.t_rpm2 = shared_data.t_rpm2;
   local_packet.t_shift = shared_data.t_shift;
   local_packet.t_torq1 = shared_data.t_torq1;
   local_packet.t_torq2 = shared_data.t_torq2;
   interrupts();
   handleIncomingCommands();
-
-  // Apply any persisted RPM spoke counts exactly once, as soon as setup1() confirms RpmCounter has
-  // finished initializing on core1 (see the core1_setup_done comment above for why this can't just
-  // happen unconditionally in setup()).
-  static bool rpm_config_applied = false;
-  if (!rpm_config_applied && core1_setup_done) {
-    if (loaded_rpm_spokes_have_value) {
-      RpmCounter::setSpokes(0, loaded_rpm1_spokes);
-      RpmCounter::setSpokes(1, loaded_rpm2_spokes);
-    }
-    rpm_config_applied = true;
-  }
 
   // Auto-save: build a snapshot of the current live (non-diagnostic) config every iteration and
   // hand it to ConfigStore, which debounces and only actually writes to flash once settings have
@@ -514,7 +485,6 @@ void loop() {
       snapshot.write_en[i] = cfg_write_en[i];
       snapshot.freq[i] = cfg_freq[i];
     }
-    RpmCounter::getSpokes(snapshot.rpm1_spokes, snapshot.rpm2_spokes);
     ConfigStore::poll(snapshot);
   }
 
@@ -535,10 +505,36 @@ void loop() {
 
   unsigned long now = micros();
 
-  // Each enabled channel is scheduled and transmitted completely independently -- one channel
-  // running at a high rate (e.g. torque in the future) never throttles or is throttled by another
-  // channel's rate, since each has its own interval, own timestamp, and its own packet.
-  for (int i = 0; i < 5; i++) {
+  // RPM channels (0/1) are edge-triggered, not scheduled: fully drain each channel's ring buffer
+  // every loop() iteration and send exactly one packet per physical tooth, with the tooth's own
+  // capture timestamp and raw inter-edge period as the payload (see the telemetry packet comment
+  // near the top of this file). cfg_write_en[] still gates whether we bother sending -- if
+  // disabled, events are still drained (so the ring doesn't build up stale backlog) but discarded
+  // rather than transmitted.
+  for (uint8_t ch = 0; ch <= 1; ch++) {
+    uint64_t edgeUs = 0;
+    uint32_t periodUs = 0;
+    while (RpmCounter::popEdge(ch, edgeUs, periodUs)) {
+      if (!cfg_write_en[ch]) continue;
+
+      int32_t payload_val = (int32_t)periodUs;
+      uint8_t packet[TELEMETRY_PACKET_LEN];
+      packet[0] = TELEMETRY_SYNC0;
+      packet[1] = TELEMETRY_SYNC1;
+      packet[2] = ch;
+      packet[3] = tx_seq[ch]++;
+      memcpy(&packet[4], &payload_val, 4);
+      memcpy(&packet[8], &edgeUs, 8);
+      packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
+
+      usb_web.write(packet, TELEMETRY_PACKET_LEN);
+    }
+  }
+
+  // Shift/torque (channels 2-4) stay on their own configurable polling rate -- each enabled
+  // channel is scheduled and transmitted completely independently, so one channel running at a
+  // high rate never throttles or is throttled by another channel's rate.
+  for (int i = 2; i <= 4; i++) {
     if (cfg_write_en[i] && (now - last_tx_us[i] >= intervals_us[i])) {
       last_tx_us[i] = now;
 
@@ -546,8 +542,6 @@ void loop() {
       uint64_t capture_us = 0;
 
       switch (i) {
-        case 0: payload_val = (int32_t)local_packet.rpm1;  capture_us = local_packet.t_rpm1;  break;
-        case 1: payload_val = (int32_t)local_packet.rpm2;  capture_us = local_packet.t_rpm2;  break;
         case 2: payload_val = (int32_t)local_packet.shift; capture_us = local_packet.t_shift; break;
         case 3: payload_val = (int32_t)local_packet.torq1; capture_us = local_packet.t_torq1; break;
         case 4: payload_val = (int32_t)local_packet.torq2; capture_us = local_packet.t_torq2; break;

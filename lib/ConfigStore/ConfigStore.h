@@ -2,17 +2,22 @@
 
 #include <Arduino.h>
 
-// Persists the operational (non-diagnostic) live configuration -- per-channel enable/Hz and RPM
-// spoke counts -- to the RP2040's emulated flash EEPROM, so settings survive a power cycle instead
-// of resetting to the compiled-in defaults every boot. Diagnostic/bench toggles (demo mode,
-// pin/interrupt/count test modes) are intentionally NOT persisted here -- those are transient
-// debugging aids, not something you'd want silently surviving a power cycle.
+// Persists the operational (non-diagnostic) live configuration -- per-channel enable/Hz -- to the
+// RP2040's emulated flash EEPROM, so settings survive a power cycle instead of resetting to the
+// compiled-in defaults every boot. Diagnostic/bench toggles (demo mode, pin/interrupt/count test
+// modes) are intentionally NOT persisted here -- those are transient debugging aids, not something
+// you'd want silently surviving a power cycle.
+//
+// RPM spoke counts are NOT persisted here (or anywhere on-device) -- RPM channels now stream a raw
+// per-tooth period to the host (see RpmCounter::popEdge()) and spoke count is purely a host-side
+// concern for reconstructing RPM from that period, so it has no firmware-side state to persist.
+// freq[0]/freq[1] (RPM1/RPM2) are consequently vestigial: accepted by command 0x02 for wire
+// compatibility but have no scheduling effect, since RPM channels are edge-triggered rather than
+// polled at a configured rate.
 namespace ConfigStore {
 struct RuntimeConfig {
   bool write_en[5] = {true, true, true, true, true};
   uint16_t freq[5] = {0, 0, 0, 0, 0};
-  uint16_t rpm1_spokes = 1;
-  uint16_t rpm2_spokes = 1;
 };
 
 // Must be called once at startup (before load()/poll()) -- reserves and loads the emulated EEPROM

@@ -1,121 +1,83 @@
 #include "RpmCounter.h"
 
 namespace {
-// Ring buffer of recent edge timestamps per channel. Sized generously above any realistic
-// edgesPerUpdate so a smoothing window can be widened at runtime without a rebuild.
-constexpr size_t EDGE_BUF_SIZE = 64;
+// Per-channel SPSC (single-producer single-consumer) ring buffer of raw edge events. Producer is
+// the pin ISR (primaryEdge()/secondaryEdge(), core1) or injectSyntheticEdge() (also core1, called
+// from loop1()'s demo-mode branch -- guarded against the real ISR below since both run on core1).
+// Consumer is popEdge(), called from core0. head/tail are only ever written by their respective
+// single owner (producer owns head, consumer owns tail), so no lock is needed -- just memory
+// barriers (__sync_synchronize()) to ensure each side's writes are visible to the other core in
+// the right order before the index that "publishes" them is updated.
+//
+// Sized well above any realistic sustained edge rate (see the begin()/loop() cadence discussion in
+// main.cpp) so overflow only happens if the consumer core genuinely stalls -- must be a power of
+// two so index wrap can use a cheap mask instead of a modulo.
+constexpr uint32_t EVENT_RING_SIZE = 256;
+constexpr uint32_t EVENT_RING_MASK = EVENT_RING_SIZE - 1;
 
-// A stale reading (no edges for this long) reports 0 RPM instead of holding a frozen value.
-constexpr uint64_t RPM_STALE_TIMEOUT_US = 500000;
-// Once stale, re-affirm the 0 reading at this cadence rather than every single loop1() iteration
-// (which runs continuously with no delay) -- the value can't change while stale, so there's no
-// benefit to re-timestamping it faster than this.
-constexpr uint64_t RPM_STALE_REPORT_INTERVAL_US = 50000;
+struct EdgeEvent {
+  uint64_t edgeUs;
+  uint32_t periodUs;
+};
 
 struct RpmChannelState {
-  // Written only from the pin ISR; read from update() under noInterrupts() for atomicity (ISR and
-  // update() both run on core1, so disabling interrupts is sufficient -- no cross-core access).
-  uint64_t edgeBuf[EDGE_BUF_SIZE] = {0};
-  volatile uint32_t bufHead = 0;         // next write index into edgeBuf
-  volatile uint32_t totalEdges = 0;      // lifetime edge count, for staleness/diagnostics
-  volatile uint64_t lastEdgeUs = 0;      // 0 == no edge ever seen
-  volatile uint32_t interruptEvents = 0; // cleared by readAndClearInterruptEvents
-  volatile uint32_t diagPulses = 0;      // cleared by readWindowCounts
+  EdgeEvent ring[EVENT_RING_SIZE] = {};
+  volatile uint32_t head = 0;    // next slot the producer will write (producer-owned)
+  volatile uint32_t tail = 0;    // next slot the consumer will read (consumer-owned)
+  volatile uint32_t dropped = 0; // producer-owned; incremented instead of overwriting on overflow
 
-  // spokes/edgesPerUpdate are written from core0 (USB command handling in main.cpp) but read
-  // from core1 (RPM computation below) -- volatile for cross-core visibility, plain aligned
-  // 16-bit reads/writes so no additional locking is needed for these two.
-  volatile uint16_t spokes = 1;
-  volatile uint16_t edgesPerUpdate = 1;
+  // Producer-only bookkeeping (only ever touched from core1 -- the ISR and injectSyntheticEdge(),
+  // which is itself guarded with noInterrupts()/interrupts() against the real ISR -- so no lock
+  // needed here either).
+  uint64_t lastEdgeUs = 0; // 0 == no edge yet this "epoch" (since begin(), or since diagnostics reset)
 
-  // Core1-only bookkeeping (never touched from core0 or the ISR), safe without a lock.
-  uint32_t lastReportedEdges = 0;
-  uint64_t lastStaleReportUs = 0;
-  bool wasStaleReported = false;
+  // Diagnostic counters, cleared independently by their own read-and-clear calls.
+  volatile uint32_t totalEdges = 0;
+  volatile uint32_t interruptEvents = 0;
+  volatile uint32_t diagPulses = 0;
 };
 
 RpmChannelState primaryState;
 RpmChannelState secondaryState;
 bool interruptTestMode = false;
 
+// Producer-side push -- called only from core1 (ISR or the interrupt-guarded synthetic injector).
+// Drop-newest on overflow: if the consumer has fallen behind enough to fill the ring, we do NOT
+// overwrite the oldest still-unread event (that would require the producer to also own/advance
+// tail, breaking the single-owner-per-index invariant that makes this lock-free). Instead the new
+// event is discarded and `dropped` incremented -- the consumer sees a gap (via the dropped
+// counter) rather than corrupted/torn data.
+void pushEdge(RpmChannelState& s, uint64_t edgeUs, uint32_t periodUs) {
+  const uint32_t head = s.head;
+  const uint32_t nextHead = (head + 1) & EVENT_RING_MASK;
+  __sync_synchronize(); // fetch a fresh view of tail before deciding full/not-full
+  if (nextHead == s.tail) {
+    s.dropped++;
+    return;
+  }
+  s.ring[head] = {edgeUs, periodUs};
+  __sync_synchronize(); // event data must be visible before the consumer can see the new head
+  s.head = nextHead;
+}
+
 void recordEdge(RpmChannelState& s) {
   const uint64_t nowUs = time_us_64();
-  s.edgeBuf[s.bufHead % EDGE_BUF_SIZE] = nowUs;
-  s.bufHead = s.bufHead + 1;
-  s.totalEdges++;
+  const uint32_t periodUs = (s.lastEdgeUs != 0) ? (uint32_t)(nowUs - s.lastEdgeUs) : 0;
   s.lastEdgeUs = nowUs;
+  pushEdge(s, nowUs, periodUs);
+  s.totalEdges++;
   s.diagPulses++;
   if (interruptTestMode) s.interruptEvents++;
 }
 
 void primaryEdge() { recordEdge(primaryState); }
 void secondaryEdge() { recordEdge(secondaryState); }
-
-// Edge-triggered reciprocal counting: as soon as `edgesPerUpdate` new edges have landed since the
-// last report, compute RPM from the exact elapsed time spanning them -- exact and unbiased
-// regardless of RPM or acceleration, with no smoothing lag and no fixed polling window. With the
-// default edgesPerUpdate=1 this recomputes on every single edge (e.g. ~900-1100 Hz for 12-16 tooth
-// wheels at 4000-4600 RPM), far above the old fixed 20ms/50Hz window. Raising edgesPerUpdate trades
-// update latency for immunity to tooth-spacing manufacturing tolerance, if that noise ever matters
-// more than raw speed for a given wheel -- left to the app/operator to tune per RpmCounter.h.
-void computeChannel(RpmChannelState& s, const uint64_t nowUs, uint32_t& rpmOut, uint64_t& captureOut, bool& readyOut) {
-  readyOut = false;
-  const uint16_t edgesPerUpdate = s.edgesPerUpdate; // snapshot once; only used to size the read below
-
-  // Single lock window covering totalEdges/lastEdgeUs/bufHead and (when needed) the two edge-buffer
-  // samples they index into, so nothing else can advance bufHead/overwrite edgeBuf between deciding
-  // which slots to read and actually reading them.
-  noInterrupts();
-  const uint32_t totalEdges = s.totalEdges;
-  const uint64_t lastEdgeUs = s.lastEdgeUs;
-  const uint32_t head = s.bufHead;
-  uint64_t newest = 0;
-  uint64_t oldest = 0;
-  const bool haveSpan = totalEdges > (uint32_t)edgesPerUpdate;
-  if (haveSpan) {
-    newest = s.edgeBuf[(head + EDGE_BUF_SIZE - 1) % EDGE_BUF_SIZE];
-    oldest = s.edgeBuf[(head + EDGE_BUF_SIZE - 1 - edgesPerUpdate) % EDGE_BUF_SIZE];
-  }
-  interrupts();
-
-  const bool stale = (lastEdgeUs == 0) || (nowUs - lastEdgeUs) > RPM_STALE_TIMEOUT_US;
-  if (stale) {
-    if (!s.wasStaleReported || (nowUs - s.lastStaleReportUs) >= RPM_STALE_REPORT_INTERVAL_US) {
-      rpmOut = 0;
-      captureOut = nowUs;
-      readyOut = true;
-      s.wasStaleReported = true;
-      s.lastStaleReportUs = nowUs;
-      s.lastReportedEdges = totalEdges;
-    }
-    return;
-  }
-
-  const uint32_t edgesSinceReport = totalEdges - s.lastReportedEdges;
-  // Require totalEdges > edgesPerUpdate (not just >=) so "oldest" above always points at a real
-  // edge the ISR has actually written, never an unwritten (zero) ring-buffer slot.
-  if (edgesSinceReport >= edgesPerUpdate && haveSpan) {
-    const uint64_t spanUs = newest - oldest;
-    rpmOut = spanUs > 0
-      ? (uint32_t)(60000000.0 * (double)edgesPerUpdate / ((double)spanUs * (double)s.spokes))
-      : 0;
-    captureOut = newest;
-    readyOut = true;
-    s.lastReportedEdges = totalEdges;
-    s.wasStaleReported = false;
-  }
-}
 }
 
 namespace RpmCounter {
-void begin(uint8_t primaryPin, uint8_t secondaryPin, uint16_t newPrimarySpokes, uint16_t newSecondarySpokes,
-           uint16_t primaryEdgesPerUpdate, uint16_t secondaryEdgesPerUpdate) {
+void begin(uint8_t primaryPin, uint8_t secondaryPin) {
   primaryState = RpmChannelState();
   secondaryState = RpmChannelState();
-  primaryState.spokes = newPrimarySpokes > 0 ? newPrimarySpokes : 1;
-  secondaryState.spokes = newSecondarySpokes > 0 ? newSecondarySpokes : 1;
-  primaryState.edgesPerUpdate = primaryEdgesPerUpdate > 0 ? primaryEdgesPerUpdate : 1;
-  secondaryState.edgesPerUpdate = secondaryEdgesPerUpdate > 0 ? secondaryEdgesPerUpdate : 1;
 
   // Optoisolator outputs are normally open-collector/open-drain.
   pinMode(primaryPin, INPUT_PULLUP);
@@ -124,11 +86,43 @@ void begin(uint8_t primaryPin, uint8_t secondaryPin, uint16_t newPrimarySpokes, 
   attachInterrupt(digitalPinToInterrupt(secondaryPin), secondaryEdge, RISING);
 }
 
-void update(uint32_t& primaryRpm, uint32_t& secondaryRpm, uint64_t& primaryCaptureUs, uint64_t& secondaryCaptureUs,
-            bool& primaryReady, bool& secondaryReady) {
+bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs) {
+  RpmChannelState& s = (channel == 0) ? primaryState : secondaryState;
+  const uint32_t tail = s.tail;
+  __sync_synchronize(); // fetch a fresh view of head before deciding empty/not-empty
+  if (tail == s.head) {
+    return false;
+  }
+  const EdgeEvent ev = s.ring[tail];
+  __sync_synchronize(); // finish reading the slot before publishing that it's free again
+  s.tail = (tail + 1) & EVENT_RING_MASK;
+  edgeUs = ev.edgeUs;
+  periodUs = ev.periodUs;
+  return true;
+}
+
+void injectSyntheticEdge(uint8_t channel, uint32_t periodUs) {
+  RpmChannelState& s = (channel == 0) ? primaryState : secondaryState;
+  // Guards against the real pin ISR preempting this mid-push -- both run on core1, and unlike the
+  // ISR (which can't preempt itself), this non-ISR call site genuinely can be interrupted by a
+  // real edge arriving while demo mode is active (the pins/ISR stay attached regardless of
+  // demo_mode; see main.cpp).
+  noInterrupts();
   const uint64_t nowUs = time_us_64();
-  computeChannel(primaryState, nowUs, primaryRpm, primaryCaptureUs, primaryReady);
-  computeChannel(secondaryState, nowUs, secondaryRpm, secondaryCaptureUs, secondaryReady);
+  pushEdge(s, nowUs, periodUs);
+  s.lastEdgeUs = nowUs;
+  s.totalEdges++;
+  s.diagPulses++;
+  interrupts();
+}
+
+uint32_t readAndClearDropped(uint8_t channel) {
+  RpmChannelState& s = (channel == 0) ? primaryState : secondaryState;
+  noInterrupts();
+  const uint32_t d = s.dropped;
+  s.dropped = 0;
+  interrupts();
+  return d;
 }
 
 void readDiagnostics(uint32_t& primaryEdges, uint32_t& secondaryEdges) {
@@ -154,34 +148,6 @@ void readAndClearInterruptEvents(uint32_t& primaryEvents, uint32_t& secondaryEve
   primaryState.interruptEvents = 0;
   secondaryState.interruptEvents = 0;
   interrupts();
-}
-
-void setSpokes(uint8_t channel, uint16_t spokes) {
-  if (channel == 0) {
-    primaryState.spokes = spokes > 0 ? spokes : 1;
-  } else if (channel == 1) {
-    secondaryState.spokes = spokes > 0 ? spokes : 1;
-  }
-}
-
-void getSpokes(uint16_t& primaryOut, uint16_t& secondaryOut) {
-  primaryOut = primaryState.spokes;
-  secondaryOut = secondaryState.spokes;
-}
-
-void setEdgesPerUpdate(uint8_t channel, uint16_t edgesPerUpdate) {
-  const uint16_t clamped = edgesPerUpdate == 0 ? 1
-    : (edgesPerUpdate > (EDGE_BUF_SIZE - 1) ? (uint16_t)(EDGE_BUF_SIZE - 1) : edgesPerUpdate);
-  if (channel == 0) {
-    primaryState.edgesPerUpdate = clamped;
-  } else if (channel == 1) {
-    secondaryState.edgesPerUpdate = clamped;
-  }
-}
-
-void getEdgesPerUpdate(uint16_t& primaryOut, uint16_t& secondaryOut) {
-  primaryOut = primaryState.edgesPerUpdate;
-  secondaryOut = secondaryState.edgesPerUpdate;
 }
 
 void setInterruptTestMode(bool enabled) {
