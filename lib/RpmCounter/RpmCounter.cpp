@@ -20,16 +20,24 @@ struct EdgeEvent {
   uint32_t periodUs;
 };
 
+// A channel is considered stopped after this long without a real edge -- matches the old windowed
+// implementation's staleness threshold. checkStale() (called every loop1() iteration, see
+// RpmCounter::pollStale()) pushes one explicit periodUs=0 event when a channel crosses this, so
+// the host actually sees RPM reach zero instead of the last nonzero reading being displayed
+// forever once the wheel stops turning.
+constexpr uint64_t RPM_STALE_TIMEOUT_US = 500000;
+
 struct RpmChannelState {
   EdgeEvent ring[EVENT_RING_SIZE] = {};
   volatile uint32_t head = 0;    // next slot the producer will write (producer-owned)
   volatile uint32_t tail = 0;    // next slot the consumer will read (consumer-owned)
   volatile uint32_t dropped = 0; // producer-owned; incremented instead of overwriting on overflow
 
-  // Producer-only bookkeeping (only ever touched from core1 -- the ISR and injectSyntheticEdge(),
-  // which is itself guarded with noInterrupts()/interrupts() against the real ISR -- so no lock
-  // needed here either).
-  uint64_t lastEdgeUs = 0; // 0 == no edge yet this "epoch" (since begin(), or since diagnostics reset)
+  // Producer-only bookkeeping (only ever touched from core1 -- the ISR, injectSyntheticEdge(), and
+  // checkStale(), all of which are guarded with noInterrupts()/interrupts() against each other
+  // where they aren't already ISR-atomic -- so no additional lock is needed here).
+  uint64_t lastEdgeUs = 0;   // 0 == no edge yet this "epoch" (since begin(), or since going stale)
+  bool reportedStale = false; // true once the periodUs=0 "stopped" event has been pushed for this gap
 
   // Diagnostic counters, cleared independently by their own read-and-clear calls.
   volatile uint32_t totalEdges = 0;
@@ -60,11 +68,18 @@ void pushEdge(RpmChannelState& s, uint64_t edgeUs, uint32_t periodUs) {
   s.head = nextHead;
 }
 
+// Only pushes a telemetry event when a period is actually computable (i.e. there was a previous
+// edge to diff against) -- the very first edge since begin() or since a stale/idle reset just
+// re-arms lastEdgeUs and otherwise does nothing, so periodUs is never fabricated as 0 for "no
+// prior edge" the way the old design did. That frees periodUs=0 on the wire to mean exactly one
+// thing: an explicit "stopped" report from checkStale() below, not an edge-case artifact.
 void recordEdge(RpmChannelState& s) {
   const uint64_t nowUs = time_us_64();
-  const uint32_t periodUs = (s.lastEdgeUs != 0) ? (uint32_t)(nowUs - s.lastEdgeUs) : 0;
+  const bool havePrior = s.lastEdgeUs != 0;
+  const uint32_t periodUs = havePrior ? (uint32_t)(nowUs - s.lastEdgeUs) : 0;
   s.lastEdgeUs = nowUs;
-  pushEdge(s, nowUs, periodUs);
+  s.reportedStale = false; // a real edge always clears any prior "stopped" report
+  if (havePrior) pushEdge(s, nowUs, periodUs);
   s.totalEdges++;
   s.diagPulses++;
   if (interruptTestMode) s.interruptEvents++;
@@ -72,6 +87,24 @@ void recordEdge(RpmChannelState& s) {
 
 void primaryEdge() { recordEdge(primaryState); }
 void secondaryEdge() { recordEdge(secondaryState); }
+
+// Called every loop1() iteration (core1, same as the ISR/injector) for both channels. Pushes a
+// single explicit periodUs=0 "stopped" event the first time a channel crosses RPM_STALE_TIMEOUT_US
+// without a real edge, then resets lastEdgeUs to 0 so the *next* real edge is treated as a fresh
+// "no prior edge" case (re-arming, not pushed) rather than computing a huge bogus period spanning
+// the entire idle gap -- the edge after that one is the first real RPM reading post-restart.
+void checkStale(RpmChannelState& s) {
+  noInterrupts(); // guards against the real ISR preempting this, same as injectSyntheticEdge()
+  const uint64_t nowUs = time_us_64();
+  const uint64_t lastEdge = s.lastEdgeUs;
+  const bool haveEdge = lastEdge != 0;
+  if (haveEdge && !s.reportedStale && (nowUs - lastEdge) > RPM_STALE_TIMEOUT_US) {
+    pushEdge(s, nowUs, 0);
+    s.reportedStale = true;
+    s.lastEdgeUs = 0;
+  }
+  interrupts();
+}
 }
 
 namespace RpmCounter {
@@ -84,6 +117,11 @@ void begin(uint8_t primaryPin, uint8_t secondaryPin) {
   pinMode(secondaryPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(primaryPin), primaryEdge, RISING);
   attachInterrupt(digitalPinToInterrupt(secondaryPin), secondaryEdge, RISING);
+}
+
+void pollStale() {
+  checkStale(primaryState);
+  checkStale(secondaryState);
 }
 
 bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs) {

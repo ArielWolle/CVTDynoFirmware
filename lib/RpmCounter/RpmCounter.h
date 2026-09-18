@@ -15,21 +15,24 @@ namespace RpmCounter {
 void begin(uint8_t primaryPin, uint8_t secondaryPin);
 
 // Pops the oldest pending edge event for the given channel (0=primary, 1=secondary), if any.
-//   edgeUs   -- time_us_64() timestamp the edge was captured.
-//   periodUs -- elapsed time since the previous edge on this channel. 0 means "no previous edge to
-//               compare against" (the very first edge since begin(), or the first edge after a
-//               gap -- see NOTE below) -- callers should treat periodUs==0 as a reset/discontinuity
-//               marker, not as an actual zero-length period.
+//   edgeUs   -- time_us_64() timestamp the edge was captured (or of the stale check, for a
+//               periodUs==0 "stopped" event -- see below).
+//   periodUs -- elapsed time since the previous edge on this channel, EXCEPT periodUs==0, which is
+//               an explicit "this channel has stopped" report pushed by pollStale() once no real
+//               edge has arrived for RPM_STALE_TIMEOUT_US (see the .cpp) -- a real report, meant to
+//               be applied as RPM==0, not a discontinuity marker to be ignored. A period is only
+//               ever computed from two real edges, so periodUs is never fabricated as 0 for "no
+//               prior edge to diff against" (see recordEdge() in the .cpp) -- the very first edge
+//               since begin() or since a stale report just re-arms the timer silently instead.
 // Returns false when there are no more pending events for this channel right now. Intended to be
 // called in a tight "while (popEdge(...))" loop so a channel is always fully drained -- the ring
 // this reads from is sized to absorb realistic bursts (see EVENT_RING_SIZE in the .cpp), but a
 // consumer that doesn't drain promptly will eventually see dropped events (readAndClearDropped()).
-//
-// NOTE: unlike the previous polled implementation, there is no on-device staleness/idle timeout --
-// if the wheel stops turning, no more events arrive, period. Detecting "engine stopped" from a
-// gap in incoming events is left to the consumer, which is better positioned to pick a timeout
-// appropriate for its own display/logging cadence than the firmware is.
 bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs);
+
+// Must be called every loop1() iteration (core1) so idle channels are detected and reported -- see
+// the periodUs==0 "stopped" semantics on popEdge() above.
+void pollStale();
 
 // Bench/demo-mode support: inject a synthetic edge on the given channel with the given period, as
 // if it had physically arrived just now. Goes through the exact same ring buffer as real edges, so

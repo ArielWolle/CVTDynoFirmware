@@ -54,11 +54,14 @@ Adafruit_USBD_WebUSB usb_web;
 //   [3]    per-channel rolling sequence number (drop detection on the receiving end)
 //   [4..7] int32 value, little-endian --
 //           for channels 0-1 (RPM1/RPM2) this is the raw inter-edge period in microseconds since
-//           the previous tooth on that channel, NOT an RPM value. 0 means "no previous edge to
-//           compare against" (first edge since boot, or first edge after a gap) and should be
-//           treated as a reset/discontinuity marker rather than an actual zero-length period. The
-//           host reconstructs RPM itself: rpm = 60,000,000 / (period_us * teeth_per_revolution),
-//           since spoke/tooth count is a host-side display concern, not firmware state.
+//           the previous tooth on that channel, NOT an RPM value -- the host reconstructs RPM
+//           itself: rpm = 60,000,000 / (period_us * teeth_per_revolution), since spoke/tooth count
+//           is a host-side display concern, not firmware state. A value of exactly 0 is an
+//           explicit "this channel has stopped" report (see RpmCounter::pollStale()), pushed once
+//           after RPM_STALE_TIMEOUT_US with no real edge -- a real reading meant to be applied as
+//           RPM==0, not a marker to be ignored. A period is only ever computed from two actual
+//           edges, so periodUs is never fabricated as 0 for "first edge, nothing to diff against"
+//           the way an earlier version of this protocol did.
 //           for channels 2-4 (shift/torque) this is the polled sensor value, unchanged.
 //   [8..15] uint64 firmware capture timestamp (time_us_64()), little-endian --
 //           stamped at the moment the value was physically true (the exact tooth-edge timestamp
@@ -255,6 +258,12 @@ void loop1() {
   local_packet.t_torq1 = shared_data.t_torq1;
   local_packet.t_torq2 = shared_data.t_torq2;
   interrupts();
+
+  // Checked every iteration regardless of demo_mode -- pushes an explicit "stopped" (periodUs=0)
+  // event for either RPM channel once it's gone RPM_STALE_TIMEOUT_US without a real edge. See
+  // RpmCounter::pollStale()/popEdge() for why this makes RPM actually reach zero on the wire
+  // instead of the last nonzero reading being displayed forever after the wheel stops turning.
+  RpmCounter::pollStale();
 
   // Bench mode leaves the hardware setup intact but bypasses all sensor reads. RPM is NOT
   // computed/gated here at all anymore (real or demo) -- real edges flow ISR-straight into
