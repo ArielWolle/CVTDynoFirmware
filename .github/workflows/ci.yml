@@ -29,3 +29,15 @@ jobs:
         run: pip install --upgrade platformio
       - name: Build firmware
         run: pio run
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # .uf2 is the one actually used to flash this board (drag-and-drop while it's in
+          # BOOTSEL/mass-storage mode); .bin/.elf are included too for other tools/debugging.
+          name: firmware-${{ github.sha }}
+          path: |
+            .pio/build/*/firmware.uf2
+            .pio/build/*/firmware.bin
+            .pio/build/*/firmware.elf
+          if-no-files-found: error
+          retention-days: 90
