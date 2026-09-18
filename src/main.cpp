@@ -28,7 +28,7 @@ const uint16_t RPM2_SPOKES = 12;
 // affecting RPM's cadence, and vice versa.
 //   [0]    0xAA  sync byte 0
 //   [1]    0x55  sync byte 1
-//   [2]    channel id (0..5)
+//   [2]    channel id (0..7)
 //   [3]    per-channel rolling sequence number (drop detection on the receiving end)
 //   [4..7] int32 value, little-endian
 //   [8..15] uint64 firmware capture timestamp (time_us_64()), little-endian --
@@ -37,6 +37,10 @@ const uint16_t RPM2_SPOKES = 12;
 //           can rebuild an accurate per-channel timeline even though channels arrive at different
 //           rates.
 //   [16]   CRC-8 (poly 0x07, init 0x00) over bytes [2..15]
+//
+// Channels 6/7 are event-driven raw RPM edges (primary/secondary). For these channels bytes
+// [4..7] are a uint32 physical edge index and [8..15] are the exact ISR capture timestamp. Raw
+// streaming is disabled by default and does not alter the existing computed-RPM channels 0/1.
 //
 // Channel 5 (full throttle) is a binary input reported purely on change, not on a schedule --
 // it has no entry in cfg_write_en[]/cfg_freq[] (there is no "rate" to configure) and is instead
@@ -47,6 +51,8 @@ const uint16_t RPM2_SPOKES = 12;
 #define TELEMETRY_PACKET_LEN 17
 #define TELEMETRY_CRC_SPAN 14 // bytes [2..15]
 #define CHANNEL_FULL_THROTTLE 5
+#define CHANNEL_RPM1_RAW_EDGE 6
+#define CHANNEL_RPM2_RAW_EDGE 7
 
 // Command packet (5 bytes) -- a leading sync byte lets the parser resync after any dropped or
 // corrupted byte instead of permanently misaligning every subsequent command.
@@ -82,7 +88,7 @@ volatile bool rpm_count_test = false;                           // Command 0x08:
 // Microsecond tracking variables for independent scheduling on Core 0
 unsigned long last_tx_us[5]  = {0, 0, 0, 0, 0};
 volatile unsigned long intervals_us[5]; 
-uint8_t tx_seq[6] = {0, 0, 0, 0, 0, 0}; // channels 0-4 (scheduled) + 5 (full throttle, on-change)
+uint8_t tx_seq[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // 0-4 scheduled, 5 throttle, 6-7 raw RPM edges
 unsigned long last_rpm_pin_test_ms = 0;
 unsigned long last_rpm_count_test_ms = 0;
 unsigned long last_rpm_interrupt_test_ms = 0;
@@ -305,6 +311,16 @@ void printCurrentConfig() {
   Serial.print("RPM Edges/Update - PRIMARY: "); Serial.print(primaryEdgesPerUpdate);
   Serial.print(" | SECONDARY: "); Serial.println(secondaryEdgesPerUpdate);
   Serial.print("Full throttle input: "); Serial.println((digitalRead(PIN_FULL_THROTTLE) == LOW) ? "FULL THROTTLE" : "NOT FULL THROTTLE");
+
+  uint32_t primaryRawOverruns = 0;
+  uint32_t secondaryRawOverruns = 0;
+  RpmCounter::readRawEdgeDiagnostics(primaryRawOverruns, secondaryRawOverruns);
+  Serial.print("Raw RPM edges - PRIMARY: ");
+  Serial.print(RpmCounter::getRawEdgeStreaming(0) ? "ENABLED" : "DISABLED");
+  Serial.print(" | overruns="); Serial.println(primaryRawOverruns);
+  Serial.print("Raw RPM edges - SECONDARY: ");
+  Serial.print(RpmCounter::getRawEdgeStreaming(1) ? "ENABLED" : "DISABLED");
+  Serial.print(" | overruns="); Serial.println(secondaryRawOverruns);
   
   for (int i = 0; i < 5; i++) {
     Serial.print("Channel ["); Serial.print(i); Serial.print("] ("); Serial.print(labels[i]); Serial.print("): ");
@@ -414,8 +430,37 @@ void handleIncomingCommands() {
       Serial.print(": ");
       Serial.println(combined_val);
     }
+  } else if (cmd == 0x0A) {
+    // Command 10: Toggle raw RPM edge streaming (channel 0 primary, channel 1 secondary).
+    // No text acknowledgement is added here; command 0x03 reports state and overrun counts.
+    if (ch <= 1) RpmCounter::setRawEdgeStreaming(ch, combined_val == 1);
   }
 }
+
+constexpr uint8_t RAW_EDGE_TX_BUDGET_PER_LOOP = 16;
+
+void drainRawRpmEdges() {
+  // Existing channels retain priority: this runs only after scheduled telemetry and full throttle.
+  // Do not pop an edge unless the USB-serial layer currently has room for a complete frame.
+  for (uint8_t i = 0; i < RAW_EDGE_TX_BUDGET_PER_LOOP; i++) {
+    if (Serial.availableForWrite() < TELEMETRY_PACKET_LEN) break;
+
+    RpmCounter::RpmEdgeEvent event;
+    if (!RpmCounter::tryReadRawEdge(event)) break;
+
+    const uint8_t channel = (event.channel == 0) ? CHANNEL_RPM1_RAW_EDGE : CHANNEL_RPM2_RAW_EDGE;
+    uint8_t packet[TELEMETRY_PACKET_LEN];
+    packet[0] = TELEMETRY_SYNC0;
+    packet[1] = TELEMETRY_SYNC1;
+    packet[2] = channel;
+    packet[3] = tx_seq[channel]++;
+    memcpy(&packet[4], &event.edgeIndex, 4);
+    memcpy(&packet[8], &event.timestampUs, 8);
+    packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
+    Serial.write(packet, TELEMETRY_PACKET_LEN);
+  }
+}
+
 
 void loop() {
   SensorPacket local_packet;
@@ -502,6 +547,8 @@ void loop() {
     packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
     Serial.write(packet, TELEMETRY_PACKET_LEN);
   }
+  drainRawRpmEdges();
+
   // No per-iteration Serial.flush(): on USB-CDC that blocks until the host has drained the
   // buffer, adding needless latency/jitter to every loop iteration. Let the USB stack batch
   // writes naturally -- at these data rates (well under 1% of USB-CDC's throughput) nothing is

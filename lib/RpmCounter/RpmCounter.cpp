@@ -1,4 +1,5 @@
 #include "RpmCounter.h"
+#include <pico/util/queue.h>
 
 namespace {
 // Ring buffer of recent edge timestamps per channel. Sized generously above any realistic
@@ -38,7 +39,33 @@ RpmChannelState primaryState;
 RpmChannelState secondaryState;
 bool interruptTestMode = false;
 
-void recordEdge(RpmChannelState& s) {
+// Raw-edge transport is deliberately separate from the existing RPM estimator. The Pico SDK queue
+// is IRQ- and multicore-safe: Core 1 produces events from the pin ISRs while Core 0 drains them for
+// telemetry. A bounded queue plus per-channel overrun counters makes acquisition loss observable.
+constexpr uint32_t RAW_EDGE_QUEUE_CAPACITY = 512;
+queue_t rawEdgeQueue;
+volatile bool rawEdgeQueueReady = false;
+volatile bool rawPrimaryEnabled = false;
+volatile bool rawSecondaryEnabled = false;
+volatile uint32_t primaryRawOverruns = 0;
+volatile uint32_t secondaryRawOverruns = 0;
+
+void enqueueRawEdge(uint8_t channel, uint64_t timestampUs, uint32_t edgeIndex) {
+  if (!rawEdgeQueueReady) return;
+  if ((channel == 0 && !rawPrimaryEnabled) || (channel == 1 && !rawSecondaryEnabled)) return;
+
+  const RpmCounter::RpmEdgeEvent event{timestampUs, edgeIndex, channel};
+  if (!queue_try_add(&rawEdgeQueue, &event)) {
+    if (channel == 0) {
+      primaryRawOverruns++;
+    } else {
+      secondaryRawOverruns++;
+    }
+  }
+}
+
+
+void recordEdge(RpmChannelState& s, uint8_t channel) {
   const uint64_t nowUs = time_us_64();
   s.edgeBuf[s.bufHead % EDGE_BUF_SIZE] = nowUs;
   s.bufHead = s.bufHead + 1;
@@ -46,10 +73,11 @@ void recordEdge(RpmChannelState& s) {
   s.lastEdgeUs = nowUs;
   s.diagPulses++;
   if (interruptTestMode) s.interruptEvents++;
+  enqueueRawEdge(channel, nowUs, s.totalEdges);
 }
 
-void primaryEdge() { recordEdge(primaryState); }
-void secondaryEdge() { recordEdge(secondaryState); }
+void primaryEdge() { recordEdge(primaryState, 0); }
+void secondaryEdge() { recordEdge(secondaryState, 1); }
 
 // Edge-triggered reciprocal counting: as soon as `edgesPerUpdate` new edges have landed since the
 // last report, compute RPM from the exact elapsed time spanning them -- exact and unbiased
@@ -116,6 +144,18 @@ void begin(uint8_t primaryPin, uint8_t secondaryPin, uint16_t newPrimarySpokes, 
   secondaryState.spokes = newSecondarySpokes > 0 ? newSecondarySpokes : 1;
   primaryState.edgesPerUpdate = primaryEdgesPerUpdate > 0 ? primaryEdgesPerUpdate : 1;
   secondaryState.edgesPerUpdate = secondaryEdgesPerUpdate > 0 ? secondaryEdgesPerUpdate : 1;
+
+  if (!rawEdgeQueueReady) {
+    queue_init(&rawEdgeQueue, sizeof(RpmEdgeEvent), RAW_EDGE_QUEUE_CAPACITY);
+    rawEdgeQueueReady = true;
+  } else {
+    RpmEdgeEvent staleEvent;
+    while (queue_try_remove(&rawEdgeQueue, &staleEvent)) { }
+  }
+  rawPrimaryEnabled = false;
+  rawSecondaryEnabled = false;
+  primaryRawOverruns = 0;
+  secondaryRawOverruns = 0;
 
   // Optoisolator outputs are normally open-collector/open-drain.
   pinMode(primaryPin, INPUT_PULLUP);
@@ -187,4 +227,29 @@ void getEdgesPerUpdate(uint16_t& primaryOut, uint16_t& secondaryOut) {
 void setInterruptTestMode(bool enabled) {
   interruptTestMode = enabled;
 }
+
+void setRawEdgeStreaming(uint8_t channel, bool enabled) {
+  if (channel == 0) {
+    rawPrimaryEnabled = enabled;
+  } else if (channel == 1) {
+    rawSecondaryEnabled = enabled;
+  }
+}
+
+bool getRawEdgeStreaming(uint8_t channel) {
+  if (channel == 0) return rawPrimaryEnabled;
+  if (channel == 1) return rawSecondaryEnabled;
+  return false;
+}
+
+bool tryReadRawEdge(RpmEdgeEvent& event) {
+  if (!rawEdgeQueueReady) return false;
+  return queue_try_remove(&rawEdgeQueue, &event);
+}
+
+void readRawEdgeDiagnostics(uint32_t& primaryOverruns, uint32_t& secondaryOverruns) {
+  primaryOverruns = primaryRawOverruns;
+  secondaryOverruns = secondaryRawOverruns;
+}
+
 }
