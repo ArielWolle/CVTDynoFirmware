@@ -1,6 +1,8 @@
 #include <SPI.h>
 #include <string.h>
 #include <pico/time.h> // time_us_64()
+#include <Adafruit_TinyUSB.h> // Vendor-class (WebUSB/WinUSB) USB transport -- see USB TELEMETRY
+                              // PROTOCOL comment below for why this replaces USB-CDC ("Serial").
 #include <RpmCounter.h>
 #include <ConfigStore.h>
 
@@ -21,9 +23,22 @@ const uint16_t RPM2_SPOKES = 12;
 #define ADS_CMD_RDATA  0x01
 #define ADS_REG_MUX    0x01
 
+// USB transport: vendor-class WebUSB interface (see USB TELEMETRY PROTOCOL comment below). This
+// is a Stream, exposing the same available()/peek()/read()/write()/print() API "Serial" did, so
+// the rest of this file uses it as a near drop-in replacement for the old CDC object.
+Adafruit_USBD_WebUSB usb_web;
+
 // =========================================================================
-// SERIAL PROTOCOL v2
+// USB TELEMETRY PROTOCOL v2 (transport: WebUSB vendor interface, not USB-CDC)
 // =========================================================================
+// This device deliberately does NOT expose a virtual COM port. Serial.begin() is never called, so
+// the CDC interface (Adafruit_USBD_CDC, aka "Serial" under Adafruit TinyUSB) never gets added to
+// the enumerated USB descriptor -- only the vendor-class WebUSB interface (`usb_web` below) is
+// exposed. On Windows this auto-binds to WinUSB via WebUSB's MS OS 2.0 descriptors (no Zadig, no
+// COM port). The byte-level framing below (sync bytes, seq, CRC-8) is unchanged from the original
+// CDC-based design and read/written the same way, just over `usb_web` (a Stream, like Serial was)
+// instead of `Serial`.
+//
 // Telemetry packet (17 bytes), sent independently per channel so each channel keeps its own
 // configurable rate (see cfg_freq[] below) -- e.g. torque can run much faster than RPM without
 // affecting RPM's cadence, and vice versa.
@@ -101,7 +116,7 @@ uint16_t loaded_rpm2_spokes = 1;
 // --- Full throttle input (channel 5) -------------------------------------------------------
 // Reported purely on change via interrupt, with no polling rate to configure. The ISR only
 // captures the new state and timestamp and sets a pending flag -- it deliberately does not call
-// Serial.write() itself, since that could interrupt an in-progress write from the main scheduler
+// usb_web.write() itself, since that could interrupt an in-progress write from the main scheduler
 // loop below and corrupt both packets. loop() checks the flag every iteration and sends
 // immediately, so the added latency versus writing directly from the ISR is negligible (at most
 // one loop() iteration, typically well under a millisecond) while staying safe.
@@ -215,7 +230,7 @@ void loop1() {
   RpmCounter::update(measuredRpm1, measuredRpm2, rpm1CaptureUs, rpm2CaptureUs, rpm1Ready, rpm2Ready);
 
   // Bench mode leaves the hardware setup intact but bypasses all sensor reads.
-  // Disable it over serial to return to the real sensor path without reflashing.
+  // Disable it over USB to return to the real sensor path without reflashing.
   if (demo_mode) {
     const float phase = millis() / 1000.0f;
     const uint64_t nowUs = time_us_64();
@@ -287,8 +302,21 @@ void setup() {
     loaded_rpm_spokes_have_value = true;
   }
 
-  Serial.begin(115200);
-  while (!Serial) { delay(10); }
+  // Bring up the vendor-class WebUSB interface. Deliberately no Serial.begin() anywhere in this
+  // sketch -- that's what keeps the CDC/COM-port interface out of the enumerated USB descriptor
+  // (see USB TELEMETRY PROTOCOL comment above `usb_web`'s declaration).
+  if (!TinyUSBDevice.isInitialized()) {
+    TinyUSBDevice.begin(0);
+  }
+  usb_web.begin();
+  // If TinyUSB already auto-enumerated before usb_web.begin() added its interface, force a
+  // re-enumeration so the host actually sees the vendor interface in the descriptor set.
+  if (TinyUSBDevice.mounted()) {
+    TinyUSBDevice.detach();
+    delay(10);
+    TinyUSBDevice.attach();
+  }
+  while (!TinyUSBDevice.mounted()) { delay(1); }
 
   // Initialize intervals based on the (possibly just-loaded) startup matrix
   updateIntervals();
@@ -315,93 +343,93 @@ void updateIntervals() {
   interrupts();
 }
 
-// Helper to print out human-readable configuration profiles back over serial
+// Helper to print out human-readable configuration profiles back over USB
 void printCurrentConfig() {
   const char* labels[] = {"RPM1", "RPM2", "SHIFT", "TORQ1", "TORQ2"};
-  Serial.println("\n--- CURRENT CONFIGURATION STATUS ---");
-  Serial.print("Bench mode: "); Serial.println(demo_mode ? "ENABLED" : "DISABLED");
-  Serial.print("RPM pin test: "); Serial.println(rpm_pin_test ? "ENABLED" : "DISABLED");
-  Serial.print("RPM interrupt test: "); Serial.println(rpm_interrupt_test ? "ENABLED" : "DISABLED");
-  Serial.print("RPM count test: "); Serial.println(rpm_count_test ? "ENABLED" : "DISABLED");
+  usb_web.println("\n--- CURRENT CONFIGURATION STATUS ---");
+  usb_web.print("Bench mode: "); usb_web.println(demo_mode ? "ENABLED" : "DISABLED");
+  usb_web.print("RPM pin test: "); usb_web.println(rpm_pin_test ? "ENABLED" : "DISABLED");
+  usb_web.print("RPM interrupt test: "); usb_web.println(rpm_interrupt_test ? "ENABLED" : "DISABLED");
+  usb_web.print("RPM count test: "); usb_web.println(rpm_count_test ? "ENABLED" : "DISABLED");
   
   uint16_t primarySpokes = 1;
   uint16_t secondarySpokes = 1;
   RpmCounter::getSpokes(primarySpokes, secondarySpokes);
-  Serial.print("RPM Spokes - PRIMARY: "); Serial.print(primarySpokes);
-  Serial.print(" | SECONDARY: "); Serial.println(secondarySpokes);
+  usb_web.print("RPM Spokes - PRIMARY: "); usb_web.print(primarySpokes);
+  usb_web.print(" | SECONDARY: "); usb_web.println(secondarySpokes);
 
   uint16_t primaryEdgesPerUpdate = 1;
   uint16_t secondaryEdgesPerUpdate = 1;
   RpmCounter::getEdgesPerUpdate(primaryEdgesPerUpdate, secondaryEdgesPerUpdate);
-  Serial.print("RPM Edges/Update - PRIMARY: "); Serial.print(primaryEdgesPerUpdate);
-  Serial.print(" | SECONDARY: "); Serial.println(secondaryEdgesPerUpdate);
-  Serial.print("Persisted config: "); Serial.println(loaded_rpm_spokes_have_value ? "LOADED FROM FLASH" : "DEFAULTS (no valid saved config found)");
-  Serial.print("Full throttle input: "); Serial.println((digitalRead(PIN_FULL_THROTTLE) == LOW) ? "FULL THROTTLE" : "NOT FULL THROTTLE");
+  usb_web.print("RPM Edges/Update - PRIMARY: "); usb_web.print(primaryEdgesPerUpdate);
+  usb_web.print(" | SECONDARY: "); usb_web.println(secondaryEdgesPerUpdate);
+  usb_web.print("Persisted config: "); usb_web.println(loaded_rpm_spokes_have_value ? "LOADED FROM FLASH" : "DEFAULTS (no valid saved config found)");
+  usb_web.print("Full throttle input: "); usb_web.println((digitalRead(PIN_FULL_THROTTLE) == LOW) ? "FULL THROTTLE" : "NOT FULL THROTTLE");
   
   for (int i = 0; i < 5; i++) {
-    Serial.print("Channel ["); Serial.print(i); Serial.print("] ("); Serial.print(labels[i]); Serial.print("): ");
-    Serial.print(cfg_write_en[i] ? "ENABLED" : "DISABLED");
-    Serial.print(" | Target Tx Freq: "); Serial.print(cfg_freq[i]); Serial.println(" Hz");
+    usb_web.print("Channel ["); usb_web.print(i); usb_web.print("] ("); usb_web.print(labels[i]); usb_web.print("): ");
+    usb_web.print(cfg_write_en[i] ? "ENABLED" : "DISABLED");
+    usb_web.print(" | Target Tx Freq: "); usb_web.print(cfg_freq[i]); usb_web.println(" Hz");
   }
-  Serial.println("------------------------------------\n");
+  usb_web.println("------------------------------------\n");
 }
 
 void printRpmPinDiagnostics() {
   uint32_t primaryEdges = 0;
   uint32_t secondaryEdges = 0;
   RpmCounter::readDiagnostics(primaryEdges, secondaryEdges);
-  Serial.print("RPM TEST | PIN_RPM1=");
-  Serial.print(digitalRead(PIN_RPM1) == HIGH ? "HIGH" : "LOW");
-  Serial.print(" edges=");
-  Serial.print(primaryEdges);
-  Serial.print(" | PIN_RPM2=");
-  Serial.print(digitalRead(PIN_RPM2) == HIGH ? "HIGH" : "LOW");
-  Serial.print(" edges=");
-  Serial.println(secondaryEdges);
+  usb_web.print("RPM TEST | PIN_RPM1=");
+  usb_web.print(digitalRead(PIN_RPM1) == HIGH ? "HIGH" : "LOW");
+  usb_web.print(" edges=");
+  usb_web.print(primaryEdges);
+  usb_web.print(" | PIN_RPM2=");
+  usb_web.print(digitalRead(PIN_RPM2) == HIGH ? "HIGH" : "LOW");
+  usb_web.print(" edges=");
+  usb_web.println(secondaryEdges);
 }
 
 void printRpmCountDiagnostics() {
   uint32_t primaryCount = 0;
   uint32_t secondaryCount = 0;
   RpmCounter::readWindowCounts(primaryCount, secondaryCount);
-  Serial.print("RPM COUNT TEST | RPM1 count=");
-  Serial.print(primaryCount);
-  Serial.print(" | RPM2 count=");
-  Serial.println(secondaryCount);
+  usb_web.print("RPM COUNT TEST | RPM1 count=");
+  usb_web.print(primaryCount);
+  usb_web.print(" | RPM2 count=");
+  usb_web.println(secondaryCount);
 }
 
 void printRpmInterruptDiagnostics() {
   uint32_t primaryEvents = 0;
   uint32_t secondaryEvents = 0;
   RpmCounter::readAndClearInterruptEvents(primaryEvents, secondaryEvents);
-  Serial.print("RPM INTERRUPT TEST | PRIMARY edges=");
-  Serial.print(primaryEvents);
-  Serial.print(" | SECONDARY edges=");
-  Serial.println(secondaryEvents);
+  usb_web.print("RPM INTERRUPT TEST | PRIMARY edges=");
+  usb_web.print(primaryEvents);
+  usb_web.print(" | SECONDARY edges=");
+  usb_web.println(secondaryEvents);
 }
 
 void handleIncomingCommands() {
   // Discard any bytes that aren't the command sync byte first, so a single dropped/corrupted byte
   // can only cost the one malformed command instead of permanently misaligning every command
   // parsed afterward (the previous fixed-4-byte parser had no way to recover from that).
-  while (Serial.available() > 0 && Serial.peek() != COMMAND_SYNC) {
-    Serial.read();
+  while (usb_web.available() > 0 && usb_web.peek() != COMMAND_SYNC) {
+    usb_web.read();
   }
-  if (Serial.available() < COMMAND_PACKET_LEN) return;
+  if (usb_web.available() < COMMAND_PACKET_LEN) return;
 
-  Serial.read(); // consume sync byte
-  uint8_t cmd  = Serial.read();
-  uint8_t ch   = Serial.read();
-  uint8_t valH = Serial.read();
-  uint8_t valL = Serial.read();
+  usb_web.read(); // consume sync byte
+  uint8_t cmd  = usb_web.read();
+  uint8_t ch   = usb_web.read();
+  uint8_t valH = usb_web.read();
+  uint8_t valL = usb_web.read();
   uint16_t combined_val = ((uint16_t)valH << 8) | valL;
 
   if (cmd == 0x04) {
     demo_mode = (combined_val == 1);
-    Serial.println(demo_mode ? "BENCH MODE ENABLED" : "BENCH MODE DISABLED");
+    usb_web.println(demo_mode ? "BENCH MODE ENABLED" : "BENCH MODE DISABLED");
   } else if (cmd == 0x05) {
     rpm_pin_test = (combined_val == 1);
-    Serial.println(rpm_pin_test ? "RPM PIN TEST ENABLED" : "RPM PIN TEST DISABLED");
+    usb_web.println(rpm_pin_test ? "RPM PIN TEST ENABLED" : "RPM PIN TEST DISABLED");
   } else if (ch <= 4) {
     if (cmd == 0x01) { 
       // Command 1: Toggle stream active states
@@ -421,30 +449,30 @@ void handleIncomingCommands() {
     // Command 6: Set RPM spoke counts (channel 0 or 1, value is spoke count)
     if (ch <= 1) {
       RpmCounter::setSpokes(ch, combined_val);
-      Serial.print("RPM Spokes updated - Channel ");
-      Serial.print(ch == 0 ? "PRIMARY" : "SECONDARY");
-      Serial.print(": ");
-      Serial.println(combined_val);
+      usb_web.print("RPM Spokes updated - Channel ");
+      usb_web.print(ch == 0 ? "PRIMARY" : "SECONDARY");
+      usb_web.print(": ");
+      usb_web.println(combined_val);
     }
   } else if (cmd == 0x07) {
     // Command 7: Toggle RPM interrupt test mode
     rpm_interrupt_test = (combined_val == 1);
     RpmCounter::setInterruptTestMode(rpm_interrupt_test);
-    Serial.println(rpm_interrupt_test ? "RPM INTERRUPT TEST ENABLED" : "RPM INTERRUPT TEST DISABLED");
+    usb_web.println(rpm_interrupt_test ? "RPM INTERRUPT TEST ENABLED" : "RPM INTERRUPT TEST DISABLED");
   } else if (cmd == 0x08) {
     // Command 8: Toggle RPM count test mode
     rpm_count_test = (combined_val == 1);
-    Serial.println(rpm_count_test ? "RPM COUNT TEST ENABLED" : "RPM COUNT TEST DISABLED");
+    usb_web.println(rpm_count_test ? "RPM COUNT TEST ENABLED" : "RPM COUNT TEST DISABLED");
   } else if (cmd == 0x09) {
     // Command 9: Set RPM edges-per-update (channel 0 or 1, value is edge count spanned per
     // reciprocal-counting computation). 1 = recompute on every edge (fastest, default); higher
     // values trade update latency for immunity to tooth-spacing manufacturing tolerance.
     if (ch <= 1) {
       RpmCounter::setEdgesPerUpdate(ch, combined_val);
-      Serial.print("RPM Edges/Update updated - Channel ");
-      Serial.print(ch == 0 ? "PRIMARY" : "SECONDARY");
-      Serial.print(": ");
-      Serial.println(combined_val);
+      usb_web.print("RPM Edges/Update updated - Channel ");
+      usb_web.print(ch == 0 ? "PRIMARY" : "SECONDARY");
+      usb_web.print(": ");
+      usb_web.println(combined_val);
     }
   }
 }
@@ -534,7 +562,7 @@ void loop() {
       memcpy(&packet[8], &capture_us, 8);
       packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
 
-      Serial.write(packet, TELEMETRY_PACKET_LEN);
+      usb_web.write(packet, TELEMETRY_PACKET_LEN);
     }
   }
 
@@ -557,10 +585,10 @@ void loop() {
     memcpy(&packet[4], &payload_val, 4);
     memcpy(&packet[8], &throttleCaptureUs, 8);
     packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
-    Serial.write(packet, TELEMETRY_PACKET_LEN);
+    usb_web.write(packet, TELEMETRY_PACKET_LEN);
   }
-  // No per-iteration Serial.flush(): on USB-CDC that blocks until the host has drained the
-  // buffer, adding needless latency/jitter to every loop iteration. Let the USB stack batch
-  // writes naturally -- at these data rates (well under 1% of USB-CDC's throughput) nothing is
-  // lost, it's just no longer forced out packet-by-packet.
+  // No per-iteration usb_web.flush(): let the vendor bulk endpoint batch writes naturally instead
+  // of forcing a transfer out packet-by-packet, avoiding needless latency/jitter on every loop
+  // iteration. At these data rates (well under the full-speed USB bulk endpoint's throughput)
+  // nothing is lost by not flushing eagerly.
 }

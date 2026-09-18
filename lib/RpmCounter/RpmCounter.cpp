@@ -22,7 +22,7 @@ struct RpmChannelState {
   volatile uint32_t interruptEvents = 0; // cleared by readAndClearInterruptEvents
   volatile uint32_t diagPulses = 0;      // cleared by readWindowCounts
 
-  // spokes/edgesPerUpdate are written from core0 (serial command handling in main.cpp) but read
+  // spokes/edgesPerUpdate are written from core0 (USB command handling in main.cpp) but read
   // from core1 (RPM computation below) -- volatile for cross-core visibility, plain aligned
   // 16-bit reads/writes so no additional locking is needed for these two.
   volatile uint16_t spokes = 1;
