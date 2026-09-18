@@ -4,6 +4,15 @@
 #include <pico/time.h> // time_us_64()
 
 namespace RpmCounter {
+
+// Raw physical edge captured directly in the RPM pin ISR. channel is 0 for primary and 1 for
+// secondary; edgeIndex is that channel's lifetime physical edge count since begin().
+struct RpmEdgeEvent {
+  uint64_t timestampUs;
+  uint32_t edgeIndex;
+  uint8_t channel;
+};
+
 // edgesPerUpdate controls how many consecutive edges each reciprocal-counting computation spans:
 // 1 (default) recomputes RPM on every single edge for the lowest possible latency (edge period ~1ms
 // at typical dyno RPM/tooth counts, i.e. up to ~1kHz updates); a higher value trades latency for
@@ -28,4 +37,11 @@ void getSpokes(uint16_t& primarySpokes, uint16_t& secondarySpokes);
 void setEdgesPerUpdate(uint8_t channel, uint16_t edgesPerUpdate);
 void getEdgesPerUpdate(uint16_t& primaryOut, uint16_t& secondaryOut);
 void setInterruptTestMode(bool enabled);
+
+// Raw-edge capture is additive to the existing RPM estimator and disabled by default. The Pico SDK
+// queue behind this API is produced from Core 1 IRQs and consumed by Core 0 telemetry code.
+void setRawEdgeStreaming(uint8_t channel, bool enabled);
+bool getRawEdgeStreaming(uint8_t channel);
+bool tryReadRawEdge(RpmEdgeEvent& event);
+void readRawEdgeDiagnostics(uint32_t& primaryOverruns, uint32_t& secondaryOverruns);
 }
