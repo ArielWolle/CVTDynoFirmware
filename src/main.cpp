@@ -6,6 +6,22 @@
 #include <RpmCounter.h>
 #include <ConfigStore.h>
 
+// Injected by extra_script_version.py (see platformio.ini) from `git rev-parse`; falls back here
+// only if built outside a git checkout (e.g. from a source zip with no .git directory).
+#ifndef FIRMWARE_GIT_SHA
+#define FIRMWARE_GIT_SHA "unknown"
+#endif
+
+// Bump this whenever a change alters wire-level semantics the viewer must know about (e.g. a
+// channel's payload meaning changes, like RPM's periodUs=0 meaning shifting from "first edge,
+// nothing to diff against" to an explicit "stopped" report) -- NOT for purely additive/internal
+// changes that don't change how existing bytes should be interpreted. The viewer reports its own
+// expected value (see EXPECTED_PROTOCOL_VERSION in protocol.ts) and warns loudly on a mismatch, so
+// a stale-firmware-vs-viewer mismatch is caught immediately on connect instead of silently
+// misbehaving in a way that takes a live debugging session to track down (as happened once before
+// this existed).
+#define PROTOCOL_VERSION 1
+
 // --- PIN DEFINITIONS ---
 const int PIN_RPM1   = 3;  // Must be ODD
 const int PIN_RPM2   = 1;  // Must be ODD
@@ -365,6 +381,11 @@ void updateIntervals() {
 void printCurrentConfig() {
   const char* labels[] = {"RPM1", "RPM2", "SHIFT", "TORQ1", "TORQ2"};
   usb_web.println("\n--- CURRENT CONFIGURATION STATUS ---");
+  // Printed first and unconditionally (not gated on any test/diagnostic flag) since command 0x03
+  // is sent automatically right after every connect -- see FIRMWARE_GIT_SHA/PROTOCOL_VERSION above
+  // for why the viewer needs these on every single connection, not just when a human asks for them.
+  usb_web.print("Firmware git: "); usb_web.println(FIRMWARE_GIT_SHA);
+  usb_web.print("Protocol version: "); usb_web.println(PROTOCOL_VERSION);
   usb_web.print("Bench mode: "); usb_web.println(demo_mode ? "ENABLED" : "DISABLED");
   usb_web.print("RPM pin test: "); usb_web.println(rpm_pin_test ? "ENABLED" : "DISABLED");
   usb_web.print("RPM interrupt test: "); usb_web.println(rpm_interrupt_test ? "ENABLED" : "DISABLED");
