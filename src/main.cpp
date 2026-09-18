@@ -375,7 +375,14 @@ void printCurrentConfig() {
   for (int i = 0; i < 5; i++) {
     usb_web.print("Channel ["); usb_web.print(i); usb_web.print("] ("); usb_web.print(labels[i]); usb_web.print("): ");
     usb_web.print(cfg_write_en[i] ? "ENABLED" : "DISABLED");
-    usb_web.print(" | Target Tx Freq: "); usb_web.print(cfg_freq[i]); usb_web.println(" Hz");
+    // RPM channels (0/1) are edge-triggered, not polled -- cfg_freq[] is vestigial for them (see
+    // its declaration comment), so printing "Target Tx Freq: 0 Hz" would misleadingly look like a
+    // broken/disabled polling rate instead of correctly reflecting "no fixed rate applies here".
+    if (i <= 1) {
+      usb_web.println(" | Edge-triggered (one packet per tooth, no fixed rate)");
+    } else {
+      usb_web.print(" | Target Tx Freq: "); usb_web.print(cfg_freq[i]); usb_web.println(" Hz");
+    }
   }
   usb_web.println("------------------------------------\n");
 }
