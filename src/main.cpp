@@ -2,6 +2,7 @@
 #include <string.h>
 #include <pico/time.h> // time_us_64()
 #include <RpmCounter.h>
+#include <ConfigStore.h>
 
 // --- PIN DEFINITIONS ---
 const int PIN_RPM1   = 3;  // Must be ODD
@@ -86,6 +87,16 @@ unsigned long last_rpm_pin_test_ms = 0;
 unsigned long last_rpm_count_test_ms = 0;
 unsigned long last_rpm_interrupt_test_ms = 0;
 
+// --- Persisted config load/apply handshake between setup()/loop() (core0) and setup1() (core1) --
+// RPM spoke counts live inside RpmCounter, which is only initialized once setup1() runs on core1;
+// applying a loaded value before that would just get overwritten by RpmCounter::begin()'s defaults.
+// setup1() flips core1_setup_done once it's safe, and loop() applies any loaded spokes exactly once
+// after that, rather than assuming a fixed boot ordering between the two cores.
+volatile bool core1_setup_done = false;
+bool loaded_rpm_spokes_have_value = false;
+uint16_t loaded_rpm1_spokes = 1;
+uint16_t loaded_rpm2_spokes = 1;
+
 // --- Full throttle input (channel 5) -------------------------------------------------------
 // Reported purely on change via interrupt, with no polling rate to configure. The ISR only
 // captures the new state and timestamp and sets a pending flag -- it deliberately does not call
@@ -152,7 +163,11 @@ void setup1() {
   digitalWrite(PIN_ADS_CS, HIGH);
   digitalWrite(PIN_ADS_RST, HIGH);
   delay(10);
-  SPI.begin(); 
+  SPI.begin();
+
+  // Signal loop() (core0) that RpmCounter::begin() has finished setting its compiled-in defaults,
+  // so it's now safe to overwrite them with any persisted spoke counts.
+  core1_setup_done = true;
 }
 
 int32_t readADS1256(uint8_t channel) {
@@ -249,10 +264,26 @@ void loop1() {
 // CORE 0: TELEMETRY STREAMER & LIVE COMMAND PARSER
 // =========================================================================
 void setup() {
+  // Load any previously-saved config before anything else needs it. write_en[]/freq[] are owned
+  // by core0 and can be applied immediately; RPM spoke counts belong to RpmCounter on core1 and
+  // are staged in loaded_rpm*_spokes for loop() to apply once setup1() confirms it's ready (see
+  // core1_setup_done above).
+  ConfigStore::begin();
+  ConfigStore::RuntimeConfig loadedConfig;
+  if (ConfigStore::load(loadedConfig)) {
+    for (int i = 0; i < 5; i++) {
+      cfg_write_en[i] = loadedConfig.write_en[i];
+      cfg_freq[i] = loadedConfig.freq[i];
+    }
+    loaded_rpm1_spokes = loadedConfig.rpm1_spokes;
+    loaded_rpm2_spokes = loadedConfig.rpm2_spokes;
+    loaded_rpm_spokes_have_value = true;
+  }
+
   Serial.begin(115200);
   while (!Serial) { delay(10); }
 
-  // Initialize intervals based on default startup matrix
+  // Initialize intervals based on the (possibly just-loaded) startup matrix
   updateIntervals();
 
   pinMode(PIN_FULL_THROTTLE, INPUT_PULLUP);
@@ -291,6 +322,7 @@ void printCurrentConfig() {
   RpmCounter::getSpokes(primarySpokes, secondarySpokes);
   Serial.print("RPM Spokes - PRIMARY: "); Serial.print(primarySpokes);
   Serial.print(" | SECONDARY: "); Serial.println(secondarySpokes);
+  Serial.print("Persisted config: "); Serial.println(loaded_rpm_spokes_have_value ? "LOADED FROM FLASH" : "DEFAULTS (no valid saved config found)");
   Serial.print("Full throttle input: "); Serial.println((digitalRead(PIN_FULL_THROTTLE) == LOW) ? "FULL THROTTLE" : "NOT FULL THROTTLE");
   
   for (int i = 0; i < 5; i++) {
@@ -408,6 +440,31 @@ void loop() {
   local_packet.t_torq2 = shared_data.t_torq2;
   interrupts();
   handleIncomingCommands();
+
+  // Apply any persisted RPM spoke counts exactly once, as soon as setup1() confirms RpmCounter has
+  // finished initializing on core1 (see the core1_setup_done comment above for why this can't just
+  // happen unconditionally in setup()).
+  static bool rpm_config_applied = false;
+  if (!rpm_config_applied && core1_setup_done) {
+    if (loaded_rpm_spokes_have_value) {
+      RpmCounter::setSpokes(0, loaded_rpm1_spokes);
+      RpmCounter::setSpokes(1, loaded_rpm2_spokes);
+    }
+    rpm_config_applied = true;
+  }
+
+  // Auto-save: build a snapshot of the current live (non-diagnostic) config every iteration and
+  // hand it to ConfigStore, which debounces and only actually writes to flash once settings have
+  // been stable for a bit -- see ConfigStore::poll() for why.
+  {
+    ConfigStore::RuntimeConfig snapshot;
+    for (int i = 0; i < 5; i++) {
+      snapshot.write_en[i] = cfg_write_en[i];
+      snapshot.freq[i] = cfg_freq[i];
+    }
+    RpmCounter::getSpokes(snapshot.rpm1_spokes, snapshot.rpm2_spokes);
+    ConfigStore::poll(snapshot);
+  }
 
   if (rpm_pin_test && millis() - last_rpm_pin_test_ms >= 100) {
     last_rpm_pin_test_ms = millis();
