@@ -32,9 +32,10 @@ const uint16_t RPM2_SPOKES = 12;
 //   [3]    per-channel rolling sequence number (drop detection on the receiving end)
 //   [4..7] int32 value, little-endian
 //   [8..15] uint64 firmware capture timestamp (time_us_64()), little-endian --
-//           stamped at the moment the value was physically true (e.g. the RPM window's last
-//           used edge), not when this packet happened to be sent, so a receiver can rebuild an
-//           accurate per-channel timeline even though channels arrive at different rates.
+//           stamped at the moment the value was physically true (e.g. the last RPM edge used in
+//           its reciprocal-counting span), not when this packet happened to be sent, so a receiver
+//           can rebuild an accurate per-channel timeline even though channels arrive at different
+//           rates.
 //   [16]   CRC-8 (poly 0x07, init 0x00) over bytes [2..15]
 //
 // Channel 5 (full throttle) is a binary input reported purely on change, not on a schedule --
@@ -144,7 +145,7 @@ void setup1() {
   pinMode(PIN_RPM1, INPUT_PULLUP);
   pinMode(PIN_RPM2, INPUT_PULLUP);
   
-  RpmCounter::begin(PIN_RPM1, PIN_RPM2, RPM1_SPOKES, RPM2_SPOKES, 20);
+  RpmCounter::begin(PIN_RPM1, PIN_RPM2, RPM1_SPOKES, RPM2_SPOKES);
 
   pinMode(PIN_ADS_CS, OUTPUT);
   pinMode(PIN_ADS_RST, OUTPUT);
@@ -194,7 +195,9 @@ void loop1() {
   uint32_t measuredRpm2 = 0;
   uint64_t rpm1CaptureUs = 0;
   uint64_t rpm2CaptureUs = 0;
-  const bool rpmReady = RpmCounter::update(measuredRpm1, measuredRpm2, rpm1CaptureUs, rpm2CaptureUs);
+  bool rpm1Ready = false;
+  bool rpm2Ready = false;
+  RpmCounter::update(measuredRpm1, measuredRpm2, rpm1CaptureUs, rpm2CaptureUs, rpm1Ready, rpm2Ready);
 
   // Bench mode leaves the hardware setup intact but bypasses all sensor reads.
   // Disable it over serial to return to the real sensor path without reflashing.
@@ -212,10 +215,14 @@ void loop1() {
     local_packet.t_torq1 = nowUs;
     local_packet.t_torq2 = nowUs;
   } else {
-    if (rpmReady) {
+    // RPM1/RPM2 are independently edge-triggered (see RpmCounter) -- each is only overwritten
+    // here when its own channel actually produced a fresh reading, never gated by the other.
+    if (rpm1Ready) {
       local_packet.rpm1 = measuredRpm1;
-      local_packet.rpm2 = measuredRpm2;
       local_packet.t_rpm1 = rpm1CaptureUs;
+    }
+    if (rpm2Ready) {
+      local_packet.rpm2 = measuredRpm2;
       local_packet.t_rpm2 = rpm2CaptureUs;
     }
 
@@ -291,6 +298,12 @@ void printCurrentConfig() {
   RpmCounter::getSpokes(primarySpokes, secondarySpokes);
   Serial.print("RPM Spokes - PRIMARY: "); Serial.print(primarySpokes);
   Serial.print(" | SECONDARY: "); Serial.println(secondarySpokes);
+
+  uint16_t primaryEdgesPerUpdate = 1;
+  uint16_t secondaryEdgesPerUpdate = 1;
+  RpmCounter::getEdgesPerUpdate(primaryEdgesPerUpdate, secondaryEdgesPerUpdate);
+  Serial.print("RPM Edges/Update - PRIMARY: "); Serial.print(primaryEdgesPerUpdate);
+  Serial.print(" | SECONDARY: "); Serial.println(secondaryEdgesPerUpdate);
   Serial.print("Full throttle input: "); Serial.println((digitalRead(PIN_FULL_THROTTLE) == LOW) ? "FULL THROTTLE" : "NOT FULL THROTTLE");
   
   for (int i = 0; i < 5; i++) {
@@ -390,6 +403,17 @@ void handleIncomingCommands() {
     // Command 8: Toggle RPM count test mode
     rpm_count_test = (combined_val == 1);
     Serial.println(rpm_count_test ? "RPM COUNT TEST ENABLED" : "RPM COUNT TEST DISABLED");
+  } else if (cmd == 0x09) {
+    // Command 9: Set RPM edges-per-update (channel 0 or 1, value is edge count spanned per
+    // reciprocal-counting computation). 1 = recompute on every edge (fastest, default); higher
+    // values trade update latency for immunity to tooth-spacing manufacturing tolerance.
+    if (ch <= 1) {
+      RpmCounter::setEdgesPerUpdate(ch, combined_val);
+      Serial.print("RPM Edges/Update updated - Channel ");
+      Serial.print(ch == 0 ? "PRIMARY" : "SECONDARY");
+      Serial.print(": ");
+      Serial.println(combined_val);
+    }
   }
 }
 
