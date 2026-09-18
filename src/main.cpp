@@ -10,6 +10,7 @@ const int PIN_SHIFT  = 26; // Analog A0
 const int PIN_ADS_CS   = 17; 
 const int PIN_ADS_DRDY = 20; 
 const int PIN_ADS_RST  = 21; 
+const int PIN_FULL_THROTTLE = 0; // Binary input, pulled up; grounded (LOW) = full throttle
 
 // Number of optoisolator pulses generated per wheel revolution.
 // Set these to the physical spoke count for each RPM wheel.
@@ -27,7 +28,7 @@ const uint16_t RPM2_SPOKES = 12;
 // affecting RPM's cadence, and vice versa.
 //   [0]    0xAA  sync byte 0
 //   [1]    0x55  sync byte 1
-//   [2]    channel id (0..4)
+//   [2]    channel id (0..5)
 //   [3]    per-channel rolling sequence number (drop detection on the receiving end)
 //   [4..7] int32 value, little-endian
 //   [8..15] uint64 firmware capture timestamp (time_us_64()), little-endian --
@@ -35,10 +36,16 @@ const uint16_t RPM2_SPOKES = 12;
 //           used edge), not when this packet happened to be sent, so a receiver can rebuild an
 //           accurate per-channel timeline even though channels arrive at different rates.
 //   [16]   CRC-8 (poly 0x07, init 0x00) over bytes [2..15]
+//
+// Channel 5 (full throttle) is a binary input reported purely on change, not on a schedule --
+// it has no entry in cfg_write_en[]/cfg_freq[] (there is no "rate" to configure) and is instead
+// pushed immediately whenever the pin transitions, so the receiver sees the exact moment it
+// happened rather than waiting for the next poll.
 #define TELEMETRY_SYNC0 0xAA
 #define TELEMETRY_SYNC1 0x55
 #define TELEMETRY_PACKET_LEN 17
 #define TELEMETRY_CRC_SPAN 14 // bytes [2..15]
+#define CHANNEL_FULL_THROTTLE 5
 
 // Command packet (5 bytes) -- a leading sync byte lets the parser resync after any dropped or
 // corrupted byte instead of permanently misaligning every subsequent command.
@@ -74,10 +81,33 @@ volatile bool rpm_count_test = false;                           // Command 0x08:
 // Microsecond tracking variables for independent scheduling on Core 0
 unsigned long last_tx_us[5]  = {0, 0, 0, 0, 0};
 volatile unsigned long intervals_us[5]; 
-uint8_t tx_seq[5] = {0, 0, 0, 0, 0};
+uint8_t tx_seq[6] = {0, 0, 0, 0, 0, 0}; // channels 0-4 (scheduled) + 5 (full throttle, on-change)
 unsigned long last_rpm_pin_test_ms = 0;
 unsigned long last_rpm_count_test_ms = 0;
 unsigned long last_rpm_interrupt_test_ms = 0;
+
+// --- Full throttle input (channel 5) -------------------------------------------------------
+// Reported purely on change via interrupt, with no polling rate to configure. The ISR only
+// captures the new state and timestamp and sets a pending flag -- it deliberately does not call
+// Serial.write() itself, since that could interrupt an in-progress write from the main scheduler
+// loop below and corrupt both packets. loop() checks the flag every iteration and sends
+// immediately, so the added latency versus writing directly from the ISR is negligible (at most
+// one loop() iteration, typically well under a millisecond) while staying safe.
+volatile bool full_throttle_pending = false;
+volatile uint8_t full_throttle_value = 0;
+volatile uint64_t full_throttle_capture_us = 0;
+volatile uint64_t full_throttle_last_edge_us = 0;
+constexpr uint64_t FULL_THROTTLE_DEBOUNCE_US = 5000; // ignore bounces within 5ms of the last edge
+
+void fullThrottleChange() {
+  const uint64_t nowUs = time_us_64();
+  if (nowUs - full_throttle_last_edge_us < FULL_THROTTLE_DEBOUNCE_US) return;
+  full_throttle_last_edge_us = nowUs;
+  // Pulled up + grounded-when-active: LOW means the switch/sensor is asserting full throttle.
+  full_throttle_value = (digitalRead(PIN_FULL_THROTTLE) == LOW) ? 1 : 0;
+  full_throttle_capture_us = nowUs;
+  full_throttle_pending = true;
+}
 
 // =========================================================================
 // SENSOR DATA TYPES & BUFFERING
@@ -224,6 +254,15 @@ void setup() {
 
   // Initialize intervals based on default startup matrix
   updateIntervals();
+
+  pinMode(PIN_FULL_THROTTLE, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_FULL_THROTTLE), fullThrottleChange, CHANGE);
+  // Seed the current state as a pending send so a receiver learns it immediately at connect
+  // instead of waiting for the first actual transition (which, depending on the run, might not
+  // happen for a while).
+  full_throttle_value = (digitalRead(PIN_FULL_THROTTLE) == LOW) ? 1 : 0;
+  full_throttle_capture_us = time_us_64();
+  full_throttle_pending = true;
 }
 
 void updateIntervals() {
@@ -252,6 +291,7 @@ void printCurrentConfig() {
   RpmCounter::getSpokes(primarySpokes, secondarySpokes);
   Serial.print("RPM Spokes - PRIMARY: "); Serial.print(primarySpokes);
   Serial.print(" | SECONDARY: "); Serial.println(secondarySpokes);
+  Serial.print("Full throttle input: "); Serial.println((digitalRead(PIN_FULL_THROTTLE) == LOW) ? "FULL THROTTLE" : "NOT FULL THROTTLE");
   
   for (int i = 0; i < 5; i++) {
     Serial.print("Channel ["); Serial.print(i); Serial.print("] ("); Serial.print(labels[i]); Serial.print("): ");
@@ -415,6 +455,28 @@ void loop() {
 
       Serial.write(packet, TELEMETRY_PACKET_LEN);
     }
+  }
+
+  // Full throttle (channel 5): sent immediately on change, not on a schedule -- checked and
+  // cleared every loop() iteration rather than written directly from the ISR (see the comment on
+  // full_throttle_pending above).
+  noInterrupts();
+  const bool throttlePending = full_throttle_pending;
+  const uint8_t throttleValue = full_throttle_value;
+  const uint64_t throttleCaptureUs = full_throttle_capture_us;
+  full_throttle_pending = false;
+  interrupts();
+  if (throttlePending) {
+    int32_t payload_val = (int32_t)throttleValue;
+    uint8_t packet[TELEMETRY_PACKET_LEN];
+    packet[0] = TELEMETRY_SYNC0;
+    packet[1] = TELEMETRY_SYNC1;
+    packet[2] = CHANNEL_FULL_THROTTLE;
+    packet[3] = tx_seq[CHANNEL_FULL_THROTTLE]++;
+    memcpy(&packet[4], &payload_val, 4);
+    memcpy(&packet[8], &throttleCaptureUs, 8);
+    packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
+    Serial.write(packet, TELEMETRY_PACKET_LEN);
   }
   // No per-iteration Serial.flush(): on USB-CDC that blocks until the host has drained the
   // buffer, adding needless latency/jitter to every loop iteration. Let the USB stack batch
