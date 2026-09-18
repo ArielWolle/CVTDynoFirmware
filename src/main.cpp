@@ -40,7 +40,7 @@ const uint16_t RPM2_SPOKES = 12;
 //
 // Channels 6/7 are event-driven raw RPM edges (primary/secondary). For these channels bytes
 // [4..7] are a uint32 physical edge index and [8..15] are the exact ISR capture timestamp. Raw
-// streaming is disabled by default and does not alter the existing computed-RPM channels 0/1.
+// streaming is enabled by default and does not alter the existing computed-RPM channels 0/1.
 //
 // Channel 5 (full throttle) is a binary input reported purely on change, not on a schedule --
 // it has no entry in cfg_write_en[]/cfg_freq[] (there is no "rate" to configure) and is instead
