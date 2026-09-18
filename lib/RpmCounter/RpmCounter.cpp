@@ -45,8 +45,8 @@ bool interruptTestMode = false;
 constexpr uint32_t RAW_EDGE_QUEUE_CAPACITY = 512;
 queue_t rawEdgeQueue;
 volatile bool rawEdgeQueueReady = false;
-volatile bool rawPrimaryEnabled = false;
-volatile bool rawSecondaryEnabled = false;
+volatile bool rawPrimaryEnabled = true;
+volatile bool rawSecondaryEnabled = true;
 volatile uint32_t primaryRawOverruns = 0;
 volatile uint32_t secondaryRawOverruns = 0;
 
@@ -152,8 +152,8 @@ void begin(uint8_t primaryPin, uint8_t secondaryPin, uint16_t newPrimarySpokes, 
     RpmEdgeEvent staleEvent;
     while (queue_try_remove(&rawEdgeQueue, &staleEvent)) { }
   }
-  rawPrimaryEnabled = false;
-  rawSecondaryEnabled = false;
+  rawPrimaryEnabled = true;
+  rawSecondaryEnabled = true;
   primaryRawOverruns = 0;
   secondaryRawOverruns = 0;
 
