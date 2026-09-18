@@ -406,6 +406,17 @@ void printCurrentConfig() {
     }
   }
   usb_web.println("------------------------------------\n");
+  // Adafruit_USBD_WebUSB::write() only auto-flushes its internal FIFO once a full USB packet
+  // (BULK_PACKET_SIZE, 64 bytes at full speed) has accumulated -- see the "no per-iteration flush"
+  // comment on the telemetry writes in loop(), which deliberately relies on that for throughput.
+  // A one-shot text reply like this has no such guarantee: with nothing else writing to the same
+  // endpoint to eventually push it over that threshold, it can sit buffered for an arbitrarily
+  // long and unpredictable time (confirmed live: the same command's round-trip time varied from
+  // ~100ms to ~1s purely based on whether a telemetry write happened to land soon afterward).
+  // Explicit flush() here forces it out immediately regardless -- worth it for a low-frequency,
+  // latency-sensitive reply, unlike the high-frequency telemetry stream this optimization exists
+  // for in the first place.
+  usb_web.flush();
 }
 
 void printRpmPinDiagnostics() {
@@ -420,6 +431,7 @@ void printRpmPinDiagnostics() {
   usb_web.print(digitalRead(PIN_RPM2) == HIGH ? "HIGH" : "LOW");
   usb_web.print(" edges=");
   usb_web.println(secondaryEdges);
+  usb_web.flush(); // see printCurrentConfig()'s flush() comment -- same reasoning applies here
 }
 
 void printRpmCountDiagnostics() {
@@ -438,6 +450,7 @@ void printRpmCountDiagnostics() {
   usb_web.print(secondaryCount);
   usb_web.print(" dropped=");
   usb_web.println(secondaryDropped);
+  usb_web.flush(); // see printCurrentConfig()'s flush() comment -- same reasoning applies here
 }
 
 void printRpmInterruptDiagnostics() {
@@ -448,6 +461,7 @@ void printRpmInterruptDiagnostics() {
   usb_web.print(primaryEvents);
   usb_web.print(" | SECONDARY edges=");
   usb_web.println(secondaryEvents);
+  usb_web.flush(); // see printCurrentConfig()'s flush() comment -- same reasoning applies here
 }
 
 void handleIncomingCommands() {
@@ -499,6 +513,13 @@ void handleIncomingCommands() {
   }
   // Command IDs 0x06 and 0x09 are reserved/removed (see COMMAND_SYNC comment above) -- any other
   // unrecognized cmd value is silently ignored, same as before.
+
+  // Unconditional (a no-op if this call didn't write anything, e.g. cmd was 0x01/0x02) -- see
+  // printCurrentConfig()'s flush() comment for why a command reply needs this explicitly instead
+  // of relying on the "let telemetry batch naturally" behavior the high-frequency writes in
+  // loop() rely on. printCurrentConfig() (cmd 0x03) already flushes itself at the end of its own
+  // much longer output, so this is harmless-redundant for that path, not double-work of any kind.
+  usb_web.flush();
 }
 
 void loop() {
