@@ -3,7 +3,13 @@
 
 namespace {
 constexpr uint32_t CONFIG_MAGIC = 0x43565444; // "CVTD" -- distinguishes real saved data from erased/blank flash
-constexpr uint16_t CONFIG_VERSION = 1;        // bump whenever PersistedConfig's layout changes
+constexpr uint16_t CONFIG_VERSION = 2;        // bump whenever PersistedConfig's layout changes
+                                               // v2: dropped rpm1_spokes/rpm2_spokes -- RPM spoke
+                                               // count moved entirely to the host (see RpmCounter's
+                                               // per-tooth streaming); this intentionally makes any
+                                               // v1 flash data fail the version check below and fall
+                                               // back to compiled-in defaults, which is the designed
+                                               // recovery path for a saved-layout change.
 constexpr int EEPROM_RESERVED_SIZE = 256;     // minimum allowed by the RP2040 emulated-EEPROM library; plenty here
 constexpr unsigned long SAVE_DEBOUNCE_MS = 2000;
 
@@ -12,8 +18,6 @@ struct __attribute__((packed)) PersistedConfig {
   uint16_t version = 0;
   uint8_t  write_en[5] = {0}; // stored as bytes rather than bool for well-defined packed layout
   uint16_t freq[5] = {0};
-  uint16_t rpm1_spokes = 0;
-  uint16_t rpm2_spokes = 0;
   uint8_t  checksum = 0; // crc8 over every byte above, computed last
 };
 
@@ -39,8 +43,6 @@ void toPersisted(const ConfigStore::RuntimeConfig& in, PersistedConfig& out) {
     out.write_en[i] = in.write_en[i] ? 1 : 0;
     out.freq[i] = in.freq[i];
   }
-  out.rpm1_spokes = in.rpm1_spokes;
-  out.rpm2_spokes = in.rpm2_spokes;
   out.checksum = 0; // filled in by the caller once the rest of the struct is final
 }
 
@@ -49,7 +51,7 @@ bool persistedMatchesRuntime(const PersistedConfig& persisted, const ConfigStore
     if (persisted.write_en[i] != (runtime.write_en[i] ? 1 : 0)) return false;
     if (persisted.freq[i] != runtime.freq[i]) return false;
   }
-  return persisted.rpm1_spokes == runtime.rpm1_spokes && persisted.rpm2_spokes == runtime.rpm2_spokes;
+  return true;
 }
 
 bool runtimeChanged(const ConfigStore::RuntimeConfig& a, const ConfigStore::RuntimeConfig& b) {
@@ -57,7 +59,7 @@ bool runtimeChanged(const ConfigStore::RuntimeConfig& a, const ConfigStore::Runt
     if (a.write_en[i] != b.write_en[i]) return true;
     if (a.freq[i] != b.freq[i]) return true;
   }
-  return a.rpm1_spokes != b.rpm1_spokes || a.rpm2_spokes != b.rpm2_spokes;
+  return false;
 }
 
 // --- poll()/load() bookkeeping, all core0-only (both are only ever called from loop()/setup()) ---
@@ -97,8 +99,6 @@ bool load(RuntimeConfig& out) {
     out.write_en[i] = cfg.write_en[i] != 0;
     out.freq[i] = cfg.freq[i];
   }
-  out.rpm1_spokes = cfg.rpm1_spokes > 0 ? cfg.rpm1_spokes : 1;
-  out.rpm2_spokes = cfg.rpm2_spokes > 0 ? cfg.rpm2_spokes : 1;
 
   lastSeen = out;
   haveLastSeen = true;
