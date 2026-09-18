@@ -1,107 +1,121 @@
 #include "RpmCounter.h"
 
 namespace {
-// --- Per-window edge accounting (reset every `update()` call) ---
-volatile uint32_t primaryPulses = 0;
-volatile uint32_t secondaryPulses = 0;
-volatile uint64_t primaryWindowFirstEdgeUs = 0;   // 0 == "no edge yet this window"
-volatile uint64_t secondaryWindowFirstEdgeUs = 0;
-volatile uint64_t primaryWindowLastEdgeUs = 0;
-volatile uint64_t secondaryWindowLastEdgeUs = 0;
-
-// --- Cross-window state (persists) ---
-volatile uint64_t primaryLastEdgeUs = 0;          // most recent edge ever, for staleness checks
-volatile uint64_t secondaryLastEdgeUs = 0;
-volatile uint32_t primaryRawPeriodUs = 0;         // most recent single inter-edge interval, unsmoothed
-volatile uint32_t secondaryRawPeriodUs = 0;
-volatile uint32_t primaryTotalEdges = 0;
-volatile uint32_t secondaryTotalEdges = 0;
-volatile uint32_t primaryInterruptEvents = 0;
-volatile uint32_t secondaryInterruptEvents = 0;
-
-uint8_t primaryPin = 0;
-uint8_t secondaryPin = 0;
-uint16_t primarySpokes = 1;
-uint16_t secondarySpokes = 1;
-uint32_t windowMs = 50;
-uint32_t windowStartMs = 0;
-bool interruptTestMode = false;
+// Ring buffer of recent edge timestamps per channel. Sized generously above any realistic
+// edgesPerUpdate so a smoothing window can be widened at runtime without a rebuild.
+constexpr size_t EDGE_BUF_SIZE = 64;
 
 // A stale reading (no edges for this long) reports 0 RPM instead of holding a frozen value.
 constexpr uint64_t RPM_STALE_TIMEOUT_US = 500000;
+// Once stale, re-affirm the 0 reading at this cadence rather than every single loop1() iteration
+// (which runs continuously with no delay) -- the value can't change while stale, so there's no
+// benefit to re-timestamping it faster than this.
+constexpr uint64_t RPM_STALE_REPORT_INTERVAL_US = 50000;
 
-void primaryEdge() {
+struct RpmChannelState {
+  // Written only from the pin ISR; read from update() under noInterrupts() for atomicity (ISR and
+  // update() both run on core1, so disabling interrupts is sufficient -- no cross-core access).
+  uint64_t edgeBuf[EDGE_BUF_SIZE] = {0};
+  volatile uint32_t bufHead = 0;         // next write index into edgeBuf
+  volatile uint32_t totalEdges = 0;      // lifetime edge count, for staleness/diagnostics
+  volatile uint64_t lastEdgeUs = 0;      // 0 == no edge ever seen
+  volatile uint32_t interruptEvents = 0; // cleared by readAndClearInterruptEvents
+  volatile uint32_t diagPulses = 0;      // cleared by readWindowCounts
+
+  // spokes/edgesPerUpdate are written from core0 (serial command handling in main.cpp) but read
+  // from core1 (RPM computation below) -- volatile for cross-core visibility, plain aligned
+  // 16-bit reads/writes so no additional locking is needed for these two.
+  volatile uint16_t spokes = 1;
+  volatile uint16_t edgesPerUpdate = 1;
+
+  // Core1-only bookkeeping (never touched from core0 or the ISR), safe without a lock.
+  uint32_t lastReportedEdges = 0;
+  uint64_t lastStaleReportUs = 0;
+  bool wasStaleReported = false;
+};
+
+RpmChannelState primaryState;
+RpmChannelState secondaryState;
+bool interruptTestMode = false;
+
+void recordEdge(RpmChannelState& s) {
   const uint64_t nowUs = time_us_64();
-  if (primaryLastEdgeUs != 0) {
-    const uint64_t dt = nowUs - primaryLastEdgeUs;
-    primaryRawPeriodUs = (uint32_t)dt;
-  }
-  primaryLastEdgeUs = nowUs;
-  if (primaryWindowFirstEdgeUs == 0) primaryWindowFirstEdgeUs = nowUs;
-  primaryWindowLastEdgeUs = nowUs;
-  primaryPulses++;
-  primaryTotalEdges++;
-  if (interruptTestMode) primaryInterruptEvents++;
+  s.edgeBuf[s.bufHead % EDGE_BUF_SIZE] = nowUs;
+  s.bufHead = s.bufHead + 1;
+  s.totalEdges++;
+  s.lastEdgeUs = nowUs;
+  s.diagPulses++;
+  if (interruptTestMode) s.interruptEvents++;
 }
 
-void secondaryEdge() {
-  const uint64_t nowUs = time_us_64();
-  if (secondaryLastEdgeUs != 0) {
-    const uint64_t dt = nowUs - secondaryLastEdgeUs;
-    secondaryRawPeriodUs = (uint32_t)dt;
-  }
-  secondaryLastEdgeUs = nowUs;
-  if (secondaryWindowFirstEdgeUs == 0) secondaryWindowFirstEdgeUs = nowUs;
-  secondaryWindowLastEdgeUs = nowUs;
-  secondaryPulses++;
-  secondaryTotalEdges++;
-  if (interruptTestMode) secondaryInterruptEvents++;
-}
+void primaryEdge() { recordEdge(primaryState); }
+void secondaryEdge() { recordEdge(secondaryState); }
 
-// Reciprocal-counting frequency measurement: given N edges spanning a known elapsed time, the
-// average period is elapsed / (N-1) -- exact and unbiased regardless of RPM, with no smoothing lag.
-// This replaces an older exponential moving average of single-edge periods, which systematically
-// lagged behind RPM during acceleration/deceleration (exactly the part of a dyno pull that
-// matters most). When too few edges land in a window to do reciprocal counting (very low RPM
-// relative to the window length), we fall back to the single most recent raw inter-edge period
-// with no smoothing applied, so the reported value is always the least-processed accurate number
-// available rather than a filtered/lagged one -- any desired smoothing is left to the app layer,
-// which can see the full raw stream and choose a window.
-uint32_t computeRpm(uint32_t edgeCount, uint64_t windowFirstUs, uint64_t windowLastUs, uint32_t rawPeriodUs, uint16_t spokes) {
-  if (edgeCount >= 2 && windowLastUs > windowFirstUs) {
-    const double elapsedUs = (double)(windowLastUs - windowFirstUs);
-    const double periodUs = elapsedUs / (double)(edgeCount - 1);
-    return (uint32_t)(60000000.0 / (periodUs * (double)spokes));
+// Edge-triggered reciprocal counting: as soon as `edgesPerUpdate` new edges have landed since the
+// last report, compute RPM from the exact elapsed time spanning them -- exact and unbiased
+// regardless of RPM or acceleration, with no smoothing lag and no fixed polling window. With the
+// default edgesPerUpdate=1 this recomputes on every single edge (e.g. ~900-1100 Hz for 12-16 tooth
+// wheels at 4000-4600 RPM), far above the old fixed 20ms/50Hz window. Raising edgesPerUpdate trades
+// update latency for immunity to tooth-spacing manufacturing tolerance, if that noise ever matters
+// more than raw speed for a given wheel -- left to the app/operator to tune per RpmCounter.h.
+void computeChannel(RpmChannelState& s, const uint64_t nowUs, uint32_t& rpmOut, uint64_t& captureOut, bool& readyOut) {
+  readyOut = false;
+  const uint16_t edgesPerUpdate = s.edgesPerUpdate; // snapshot once; only used to size the read below
+
+  // Single lock window covering totalEdges/lastEdgeUs/bufHead and (when needed) the two edge-buffer
+  // samples they index into, so nothing else can advance bufHead/overwrite edgeBuf between deciding
+  // which slots to read and actually reading them.
+  noInterrupts();
+  const uint32_t totalEdges = s.totalEdges;
+  const uint64_t lastEdgeUs = s.lastEdgeUs;
+  const uint32_t head = s.bufHead;
+  uint64_t newest = 0;
+  uint64_t oldest = 0;
+  const bool haveSpan = totalEdges > (uint32_t)edgesPerUpdate;
+  if (haveSpan) {
+    newest = s.edgeBuf[(head + EDGE_BUF_SIZE - 1) % EDGE_BUF_SIZE];
+    oldest = s.edgeBuf[(head + EDGE_BUF_SIZE - 1 - edgesPerUpdate) % EDGE_BUF_SIZE];
   }
-  if (rawPeriodUs > 0) {
-    return (uint32_t)(60000000.0 / ((double)rawPeriodUs * (double)spokes));
+  interrupts();
+
+  const bool stale = (lastEdgeUs == 0) || (nowUs - lastEdgeUs) > RPM_STALE_TIMEOUT_US;
+  if (stale) {
+    if (!s.wasStaleReported || (nowUs - s.lastStaleReportUs) >= RPM_STALE_REPORT_INTERVAL_US) {
+      rpmOut = 0;
+      captureOut = nowUs;
+      readyOut = true;
+      s.wasStaleReported = true;
+      s.lastStaleReportUs = nowUs;
+      s.lastReportedEdges = totalEdges;
+    }
+    return;
   }
-  return 0;
+
+  const uint32_t edgesSinceReport = totalEdges - s.lastReportedEdges;
+  // Require totalEdges > edgesPerUpdate (not just >=) so "oldest" above always points at a real
+  // edge the ISR has actually written, never an unwritten (zero) ring-buffer slot.
+  if (edgesSinceReport >= edgesPerUpdate && haveSpan) {
+    const uint64_t spanUs = newest - oldest;
+    rpmOut = spanUs > 0
+      ? (uint32_t)(60000000.0 * (double)edgesPerUpdate / ((double)spanUs * (double)s.spokes))
+      : 0;
+    captureOut = newest;
+    readyOut = true;
+    s.lastReportedEdges = totalEdges;
+    s.wasStaleReported = false;
+  }
 }
 }
 
 namespace RpmCounter {
-void begin(uint8_t newPrimaryPin, uint8_t newSecondaryPin, uint16_t newPrimarySpokes, uint16_t newSecondarySpokes, uint32_t newWindowMs) {
-  primaryPin = newPrimaryPin;
-  secondaryPin = newSecondaryPin;
-  primarySpokes = newPrimarySpokes > 0 ? newPrimarySpokes : 1;
-  secondarySpokes = newSecondarySpokes > 0 ? newSecondarySpokes : 1;
-  windowMs = newWindowMs;
-  windowStartMs = millis();
-  primaryPulses = 0;
-  secondaryPulses = 0;
-  primaryWindowFirstEdgeUs = 0;
-  secondaryWindowFirstEdgeUs = 0;
-  primaryWindowLastEdgeUs = 0;
-  secondaryWindowLastEdgeUs = 0;
-  primaryTotalEdges = 0;
-  secondaryTotalEdges = 0;
-  primaryInterruptEvents = 0;
-  secondaryInterruptEvents = 0;
-  primaryLastEdgeUs = 0;
-  secondaryLastEdgeUs = 0;
-  primaryRawPeriodUs = 0;
-  secondaryRawPeriodUs = 0;
+void begin(uint8_t primaryPin, uint8_t secondaryPin, uint16_t newPrimarySpokes, uint16_t newSecondarySpokes,
+           uint16_t primaryEdgesPerUpdate, uint16_t secondaryEdgesPerUpdate) {
+  primaryState = RpmChannelState();
+  secondaryState = RpmChannelState();
+  primaryState.spokes = newPrimarySpokes > 0 ? newPrimarySpokes : 1;
+  secondaryState.spokes = newSecondarySpokes > 0 ? newSecondarySpokes : 1;
+  primaryState.edgesPerUpdate = primaryEdgesPerUpdate > 0 ? primaryEdgesPerUpdate : 1;
+  secondaryState.edgesPerUpdate = secondaryEdgesPerUpdate > 0 ? secondaryEdgesPerUpdate : 1;
 
   // Optoisolator outputs are normally open-collector/open-drain.
   pinMode(primaryPin, INPUT_PULLUP);
@@ -110,83 +124,64 @@ void begin(uint8_t newPrimaryPin, uint8_t newSecondaryPin, uint16_t newPrimarySp
   attachInterrupt(digitalPinToInterrupt(secondaryPin), secondaryEdge, RISING);
 }
 
-bool update(uint32_t& primaryRpm, uint32_t& secondaryRpm, uint64_t& primaryCaptureUs, uint64_t& secondaryCaptureUs) {
-  const uint32_t nowMs = millis();
-  const uint32_t elapsedMs = nowMs - windowStartMs;
-  if (elapsedMs < windowMs) return false;
+void update(uint32_t& primaryRpm, uint32_t& secondaryRpm, uint64_t& primaryCaptureUs, uint64_t& secondaryCaptureUs,
+            bool& primaryReady, bool& secondaryReady) {
   const uint64_t nowUs = time_us_64();
-
-  noInterrupts();
-  const uint32_t primaryCount = primaryPulses;
-  const uint32_t secondaryCount = secondaryPulses;
-  const uint64_t primaryFirstUs = primaryWindowFirstEdgeUs;
-  const uint64_t secondaryFirstUs = secondaryWindowFirstEdgeUs;
-  const uint64_t primaryLastUs = primaryWindowLastEdgeUs;
-  const uint64_t secondaryLastUs = secondaryWindowLastEdgeUs;
-  const uint64_t primaryLastEverUs = primaryLastEdgeUs;
-  const uint64_t secondaryLastEverUs = secondaryLastEdgeUs;
-  const uint32_t primaryRawUs = primaryRawPeriodUs;
-  const uint32_t secondaryRawUs = secondaryRawPeriodUs;
-  primaryPulses = 0;
-  secondaryPulses = 0;
-  primaryWindowFirstEdgeUs = 0;
-  secondaryWindowFirstEdgeUs = 0;
-  interrupts();
-
-  const bool primaryRecent = primaryLastEverUs != 0 && (nowUs - primaryLastEverUs) <= RPM_STALE_TIMEOUT_US;
-  const bool secondaryRecent = secondaryLastEverUs != 0 && (nowUs - secondaryLastEverUs) <= RPM_STALE_TIMEOUT_US;
-
-  primaryRpm = primaryRecent ? computeRpm(primaryCount, primaryFirstUs, primaryLastUs, primaryRawUs, primarySpokes) : 0;
-  secondaryRpm = secondaryRecent ? computeRpm(secondaryCount, secondaryFirstUs, secondaryLastUs, secondaryRawUs, secondarySpokes) : 0;
-
-  // Stamp the capture time as the last edge actually used in the measurement (or "now" for a
-  // stale/zero reading) so the value is timestamped when it was physically true, not when this
-  // polling function happened to run.
-  primaryCaptureUs = primaryRecent ? (primaryCount >= 1 ? primaryLastUs : primaryLastEverUs) : nowUs;
-  secondaryCaptureUs = secondaryRecent ? (secondaryCount >= 1 ? secondaryLastUs : secondaryLastEverUs) : nowUs;
-
-  windowStartMs = nowMs;
-  return true;
+  computeChannel(primaryState, nowUs, primaryRpm, primaryCaptureUs, primaryReady);
+  computeChannel(secondaryState, nowUs, secondaryRpm, secondaryCaptureUs, secondaryReady);
 }
 
 void readDiagnostics(uint32_t& primaryEdges, uint32_t& secondaryEdges) {
   noInterrupts();
-  primaryEdges = primaryTotalEdges;
-  secondaryEdges = secondaryTotalEdges;
+  primaryEdges = primaryState.totalEdges;
+  secondaryEdges = secondaryState.totalEdges;
   interrupts();
 }
 
 void readWindowCounts(uint32_t& primaryCount, uint32_t& secondaryCount) {
   noInterrupts();
-  primaryCount = primaryPulses;
-  secondaryCount = secondaryPulses;
+  primaryCount = primaryState.diagPulses;
+  secondaryCount = secondaryState.diagPulses;
+  primaryState.diagPulses = 0;
+  secondaryState.diagPulses = 0;
   interrupts();
 }
 
 void readAndClearInterruptEvents(uint32_t& primaryEvents, uint32_t& secondaryEvents) {
   noInterrupts();
-  primaryEvents = primaryInterruptEvents;
-  secondaryEvents = secondaryInterruptEvents;
-  primaryInterruptEvents = 0;
-  secondaryInterruptEvents = 0;
+  primaryEvents = primaryState.interruptEvents;
+  secondaryEvents = secondaryState.interruptEvents;
+  primaryState.interruptEvents = 0;
+  secondaryState.interruptEvents = 0;
   interrupts();
 }
 
 void setSpokes(uint8_t channel, uint16_t spokes) {
-  noInterrupts();
   if (channel == 0) {
-    primarySpokes = spokes > 0 ? spokes : 1;
+    primaryState.spokes = spokes > 0 ? spokes : 1;
   } else if (channel == 1) {
-    secondarySpokes = spokes > 0 ? spokes : 1;
+    secondaryState.spokes = spokes > 0 ? spokes : 1;
   }
-  interrupts();
 }
 
 void getSpokes(uint16_t& primaryOut, uint16_t& secondaryOut) {
-  noInterrupts();
-  primaryOut = primarySpokes;
-  secondaryOut = secondarySpokes;
-  interrupts();
+  primaryOut = primaryState.spokes;
+  secondaryOut = secondaryState.spokes;
+}
+
+void setEdgesPerUpdate(uint8_t channel, uint16_t edgesPerUpdate) {
+  const uint16_t clamped = edgesPerUpdate == 0 ? 1
+    : (edgesPerUpdate > (EDGE_BUF_SIZE - 1) ? (uint16_t)(EDGE_BUF_SIZE - 1) : edgesPerUpdate);
+  if (channel == 0) {
+    primaryState.edgesPerUpdate = clamped;
+  } else if (channel == 1) {
+    secondaryState.edgesPerUpdate = clamped;
+  }
+}
+
+void getEdgesPerUpdate(uint16_t& primaryOut, uint16_t& secondaryOut) {
+  primaryOut = primaryState.edgesPerUpdate;
+  secondaryOut = secondaryState.edgesPerUpdate;
 }
 
 void setInterruptTestMode(bool enabled) {
