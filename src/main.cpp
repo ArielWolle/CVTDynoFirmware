@@ -247,8 +247,14 @@ void injectDemoRpmEdges(float phase) {
   static uint64_t lastDemoEdgeUs[2] = {0, 0};
   const uint64_t nowUs = time_us_64();
 
-  const float demoRpm1 = 4200 + (sin(phase) * 1100) + (phase * 18);
-  const float demoRpm2 = 2850 + (sin(phase - 0.55f) * 720) + (phase * 12);
+  // Two superimposed sine waves (a fast oscillation plus a much slower "drift" one) instead of a
+  // fast oscillation plus a raw linear `phase * k` term -- the linear term grew without bound for
+  // as long as bench mode stayed enabled (confirmed live: primary RPM reaching ~35,000+ after a
+  // few minutes, since phase is elapsed seconds and never resets). A slow sine wave gives the same
+  // "not just a fixed, repetitive oscillation" demo character while staying bounded indefinitely,
+  // however long a bench session runs.
+  const float demoRpm1 = 4200 + (sin(phase) * 1100) + (sin(phase * 0.015f) * 500);
+  const float demoRpm2 = 2850 + (sin(phase - 0.55f) * 720) + (sin((phase * 0.011f) - 0.3f) * 350);
   // One "tooth" every 60e6 / (rpm * teeth) us -- mirrors the real reciprocal-counting relationship
   // (see the telemetry packet comment on channels 0/1) so demo mode exercises a realistic cadence.
   const uint32_t periodUs1 = (demoRpm1 > 0) ? (uint32_t)(60000000.0f / (demoRpm1 * DEMO_RPM1_TEETH)) : 0;
