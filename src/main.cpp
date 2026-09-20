@@ -601,16 +601,31 @@ void loop() {
 
   unsigned long now = micros();
 
-  // RPM channels (0/1) are edge-triggered, not scheduled: fully drain each channel's ring buffer
-  // every loop() iteration and send exactly one packet per physical tooth, with the tooth's own
-  // capture timestamp and raw inter-edge period as the payload (see the telemetry packet comment
-  // near the top of this file). cfg_write_en[] still gates whether we bother sending -- if
-  // disabled, events are still drained (so the ring doesn't build up stale backlog) but discarded
-  // rather than transmitted.
-  for (uint8_t ch = 0; ch <= 1; ch++) {
-    uint64_t edgeUs = 0;
-    uint32_t periodUs = 0;
-    while (RpmCounter::popEdge(ch, edgeUs, periodUs)) {
+  // RPM channels (0/1) are edge-triggered, not scheduled: drain both channels' ring buffers every
+  // loop() iteration and send exactly one packet per physical tooth, with the tooth's own capture
+  // timestamp and raw inter-edge period as the payload (see the telemetry packet comment near the
+  // top of this file). cfg_write_en[] still gates whether we bother sending -- if disabled, events
+  // are still drained (so the ring doesn't build up stale backlog) but discarded rather than
+  // transmitted.
+  //
+  // Channels are interleaved one edge at a time per round instead of fully draining channel 0
+  // before ever touching channel 1 -- the previous "for ch, while(popEdge)" structure meant a
+  // sustained-enough primary edge rate (fast enough that production outpaces usb_web.write()'s
+  // drain rate, which blocks/spins via yield() once its small TX FIFO fills and the host hasn't
+  // caught up) could keep core0 stuck inside channel 0's while loop indefinitely -- confirmed live:
+  // secondary telemetry stopped entirely above whatever primary RPM saturated the USB link, not
+  // because of any deliberate priority, just this loop structure never reaching channel 1 while
+  // channel 0 kept refilling faster than it drained. Alternating one edge per channel per round
+  // guarantees secondary always gets a fair, equal share of available bandwidth regardless of how
+  // large primary's backlog grows.
+  bool moreRpmEdges = true;
+  while (moreRpmEdges) {
+    moreRpmEdges = false;
+    for (uint8_t ch = 0; ch <= 1; ch++) {
+      uint64_t edgeUs = 0;
+      uint32_t periodUs = 0;
+      if (!RpmCounter::popEdge(ch, edgeUs, periodUs)) continue;
+      moreRpmEdges = true;
       if (!cfg_write_en[ch]) continue;
 
       int32_t payload_val = (int32_t)periodUs;
