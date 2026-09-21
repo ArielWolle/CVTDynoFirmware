@@ -11,13 +11,26 @@ namespace {
 //
 // Sized well above any realistic sustained edge rate (see the begin()/loop() cadence discussion in
 // main.cpp) so overflow only happens if the consumer core genuinely stalls -- must be a power of
-// two so index wrap can use a cheap mask instead of a modulo.
-constexpr uint32_t EVENT_RING_SIZE = 256;
+// two so index wrap can use a cheap mask instead of a modulo. Bumped 256 -> 1024 (32 KB total
+// across both channels, well within the RP2040's 264 KB RAM) after real dyno logs showed hundreds
+// of RPM discontinuities on both channels at nearly the same times -- consistent with the consumer
+// (core0, gated by USB draining -- see main.cpp's loop()) briefly stalling for longer than 256
+// events' worth of headroom could absorb. This alone doesn't guarantee zero loss under an
+// arbitrarily long stall (see edgeCount below for making any remaining loss detectable instead of
+// invisible), but it directly addresses the transient-stall case the real data pointed to.
+constexpr uint32_t EVENT_RING_SIZE = 1024;
 constexpr uint32_t EVENT_RING_MASK = EVENT_RING_SIZE - 1;
 
 struct EdgeEvent {
   uint64_t edgeUs;
   uint32_t periodUs;
+  // See RpmCounter.h's popEdge() comment -- a monotonically increasing physical-edge count,
+  // assigned at ISR capture time, independent of (and assigned earlier than) the wire protocol's
+  // own per-packet sequence number. Lets the host tell "an edge was dropped before it ever reached
+  // the ring" (a gap in edgeCount) apart from "a packet was lost after transmission" (a gap in the
+  // per-packet seq number), which previously looked identical -- both just "missing data" -- since
+  // a ring-buffer-dropped edge never got a seq number in the first place.
+  uint32_t edgeCount;
 };
 
 // A channel is considered stopped after this long without a real edge -- matches the old windowed
@@ -35,8 +48,9 @@ constexpr uint64_t RPM_STALE_TIMEOUT_US = 500000;
 // without a check like this, and fast enough to flood the whole downstream pipeline (firmware TX
 // bandwidth and the viewer's processing) with spurious telemetry. 200us (5,000 Hz / a period
 // product of 300,000 RPM*teeth) is chosen comfortably below this while staying comfortably above
-// demo mode's fastest legitimate period (~647us at its current bounds -- see
-// injectDemoRpmEdges()'s demoRpm1/DEMO_RPM1_TEETH), so it can never reject real demo/sensor data
+// demo mode's fastest legitimate period (~568us at its current bounds, including the simulated
+// "pull cycle" peak -- see injectDemoRpmEdges()'s demoRpm1/DEMO_RPM1_TEETH), so it can never
+// reject real demo/sensor data
 // for any physically reasonable primary/secondary pulley speed and tooth count.
 //
 // Note this reduces a sustained, dense noise burst by roughly two orders of magnitude rather than
@@ -59,6 +73,7 @@ struct RpmChannelState {
   // where they aren't already ISR-atomic -- so no additional lock is needed here).
   uint64_t lastEdgeUs = 0;   // 0 == no edge yet this "epoch" (since begin(), or since going stale)
   bool reportedStale = false; // true once the periodUs=0 "stopped" event has been pushed for this gap
+  uint32_t edgeCount = 0;    // incremented per accepted physical edge -- see EdgeEvent::edgeCount
 
   // Diagnostic counters, cleared independently by their own read-and-clear calls.
   volatile uint32_t totalEdges = 0;
@@ -77,7 +92,7 @@ bool interruptTestMode = false;
 // tail, breaking the single-owner-per-index invariant that makes this lock-free). Instead the new
 // event is discarded and `dropped` incremented -- the consumer sees a gap (via the dropped
 // counter) rather than corrupted/torn data.
-void pushEdge(RpmChannelState& s, uint64_t edgeUs, uint32_t periodUs) {
+void pushEdge(RpmChannelState& s, uint64_t edgeUs, uint32_t periodUs, uint32_t edgeCount) {
   const uint32_t head = s.head;
   const uint32_t nextHead = (head + 1) & EVENT_RING_MASK;
   __sync_synchronize(); // fetch a fresh view of tail before deciding full/not-full
@@ -85,7 +100,7 @@ void pushEdge(RpmChannelState& s, uint64_t edgeUs, uint32_t periodUs) {
     s.dropped++;
     return;
   }
-  s.ring[head] = {edgeUs, periodUs};
+  s.ring[head] = {edgeUs, periodUs, edgeCount};
   __sync_synchronize(); // event data must be visible before the consumer can see the new head
   s.head = nextHead;
 }
@@ -109,7 +124,16 @@ void recordEdge(RpmChannelState& s) {
   }
   s.lastEdgeUs = nowUs;
   s.reportedStale = false; // a real edge always clears any prior "stopped" report
-  if (havePrior) pushEdge(s, nowUs, periodUs);
+  // edgeCount is incremented here -- right before the push attempt, whether or not pushEdge()
+  // actually succeeds -- specifically so a ring-overflow drop still "spends" a count value that
+  // will never reach the host, creating a detectable gap on the next event that DOES get through
+  // (see EdgeEvent::edgeCount above). Like the push itself, only edges with a prior edge to diff
+  // against count -- the very first edge since begin()/a stale reset is a re-arm, not a countable
+  // tooth, matching pushEdge() not being called for it either.
+  if (havePrior) {
+    s.edgeCount++;
+    pushEdge(s, nowUs, periodUs, s.edgeCount);
+  }
   s.totalEdges++;
   s.diagPulses++;
   if (interruptTestMode) s.interruptEvents++;
@@ -129,7 +153,12 @@ void checkStale(RpmChannelState& s) {
   const uint64_t lastEdge = s.lastEdgeUs;
   const bool haveEdge = lastEdge != 0;
   if (haveEdge && !s.reportedStale && (nowUs - lastEdge) > RPM_STALE_TIMEOUT_US) {
-    pushEdge(s, nowUs, 0);
+    // Carries the CURRENT edgeCount unchanged (not incremented) -- this is an explicit "stopped"
+    // report, not a physical edge, so it must not itself create or mask a gap. The host resets its
+    // own edgeCount-gap baseline whenever it sees this (periodUs==0) event, since the next real
+    // edge after a restart is a fresh epoch (see recordEdge()'s "no prior edge" re-arm above) and
+    // comparing across a stop/restart would otherwise look like a spurious loss.
+    pushEdge(s, nowUs, 0, s.edgeCount);
     s.reportedStale = true;
     s.lastEdgeUs = 0;
   }
@@ -154,7 +183,7 @@ void pollStale() {
   checkStale(secondaryState);
 }
 
-bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs) {
+bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs, uint32_t& edgeCount) {
   RpmChannelState& s = (channel == 0) ? primaryState : secondaryState;
   const uint32_t tail = s.tail;
   __sync_synchronize(); // fetch a fresh view of head before deciding empty/not-empty
@@ -166,6 +195,7 @@ bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs) {
   s.tail = (tail + 1) & EVENT_RING_MASK;
   edgeUs = ev.edgeUs;
   periodUs = ev.periodUs;
+  edgeCount = ev.edgeCount;
   return true;
 }
 
@@ -177,7 +207,8 @@ void injectSyntheticEdge(uint8_t channel, uint32_t periodUs) {
   // demo_mode; see main.cpp).
   noInterrupts();
   const uint64_t nowUs = time_us_64();
-  pushEdge(s, nowUs, periodUs);
+  s.edgeCount++; // demo edges count too -- see recordEdge()'s matching increment for why
+  pushEdge(s, nowUs, periodUs, s.edgeCount);
   s.lastEdgeUs = nowUs;
   s.totalEdges++;
   s.diagPulses++;

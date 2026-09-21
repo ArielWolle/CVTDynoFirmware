@@ -15,20 +15,32 @@ namespace RpmCounter {
 void begin(uint8_t primaryPin, uint8_t secondaryPin);
 
 // Pops the oldest pending edge event for the given channel (0=primary, 1=secondary), if any.
-//   edgeUs   -- time_us_64() timestamp the edge was captured (or of the stale check, for a
-//               periodUs==0 "stopped" event -- see below).
-//   periodUs -- elapsed time since the previous edge on this channel, EXCEPT periodUs==0, which is
-//               an explicit "this channel has stopped" report pushed by pollStale() once no real
-//               edge has arrived for RPM_STALE_TIMEOUT_US (see the .cpp) -- a real report, meant to
-//               be applied as RPM==0, not a discontinuity marker to be ignored. A period is only
-//               ever computed from two real edges, so periodUs is never fabricated as 0 for "no
-//               prior edge to diff against" (see recordEdge() in the .cpp) -- the very first edge
-//               since begin() or since a stale report just re-arms the timer silently instead.
+//   edgeUs     -- time_us_64() timestamp the edge was captured (or of the stale check, for a
+//                 periodUs==0 "stopped" event -- see below).
+//   periodUs   -- elapsed time since the previous edge on this channel, EXCEPT periodUs==0, which
+//                 is an explicit "this channel has stopped" report pushed by pollStale() once no
+//                 real edge has arrived for RPM_STALE_TIMEOUT_US (see the .cpp) -- a real report,
+//                 meant to be applied as RPM==0, not a discontinuity marker to be ignored. A period
+//                 is only ever computed from two real edges, so periodUs is never fabricated as 0
+//                 for "no prior edge to diff against" (see recordEdge() in the .cpp) -- the very
+//                 first edge since begin() or since a stale report just re-arms the timer silently
+//                 instead.
+//   edgeCount  -- a monotonically increasing per-channel count of physical edges accepted at ISR
+//                 capture time (see recordEdge()/injectSyntheticEdge() in the .cpp), incremented
+//                 BEFORE the event is queued here -- so if this specific event never reaches the
+//                 host at all (ring overflow, see readAndClearDropped()), the host still sees a gap
+//                 in edgeCount on the NEXT event it does receive, distinguishing real physical loss
+//                 (a gap in edgeCount) from downstream/USB packet loss (a gap in the wire protocol's
+//                 own per-packet sequence number, which is assigned later at transmit time and
+//                 would otherwise look identical to "nothing was ever dropped"). Left unchanged
+//                 (not incremented) by the periodUs==0 "stopped" event, since that's not a physical
+//                 edge -- see the host-side comment on resetting its edgeCount baseline across a
+//                 stop/restart.
 // Returns false when there are no more pending events for this channel right now. Intended to be
 // called in a tight "while (popEdge(...))" loop so a channel is always fully drained -- the ring
 // this reads from is sized to absorb realistic bursts (see EVENT_RING_SIZE in the .cpp), but a
 // consumer that doesn't drain promptly will eventually see dropped events (readAndClearDropped()).
-bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs);
+bool popEdge(uint8_t channel, uint64_t& edgeUs, uint32_t& periodUs, uint32_t& edgeCount);
 
 // Must be called every loop1() iteration (core1) so idle channels are detected and reported -- see
 // the periodUs==0 "stopped" semantics on popEdge() above.
