@@ -50,8 +50,8 @@ constexpr uint64_t RPM_STALE_TIMEOUT_US = 500000;
 // product of 300,000 RPM*teeth) is chosen comfortably below this while staying comfortably above
 // demo mode's fastest legitimate period (~568us at its current bounds, including the simulated
 // "pull cycle" peak -- see injectDemoRpmEdges()'s demoRpm1/DEMO_RPM1_TEETH), so it can never
-// reject real demo/sensor data
-// for any physically reasonable primary/secondary pulley speed and tooth count.
+// reject real demo/sensor data for any physically reasonable primary/secondary pulley speed and
+// tooth count.
 //
 // Note this reduces a sustained, dense noise burst by roughly two orders of magnitude rather than
 // eliminating it outright: a rejected edge intentionally does NOT advance lastEdgeUs (see
