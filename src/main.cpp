@@ -20,7 +20,10 @@
 // a stale-firmware-vs-viewer mismatch is caught immediately on connect instead of silently
 // misbehaving in a way that takes a live debugging session to track down (as happened once before
 // this existed).
-#define PROTOCOL_VERSION 1
+//
+// v2 (this bump): telemetry packet widened 17 -> 21 bytes to add a per-RPM-channel physical edge
+// counter -- see the USB TELEMETRY PROTOCOL comment below and RpmCounter.h's popEdge() for why.
+#define PROTOCOL_VERSION 2
 
 // --- PIN DEFINITIONS ---
 const int PIN_RPM1   = 3;  // Must be ODD
@@ -49,7 +52,7 @@ const uint16_t DEMO_RPM2_TEETH = 12;
 Adafruit_USBD_WebUSB usb_web;
 
 // =========================================================================
-// USB TELEMETRY PROTOCOL v2 (transport: WebUSB vendor interface, not USB-CDC)
+// USB TELEMETRY PROTOCOL v3 (transport: WebUSB vendor interface, not USB-CDC)
 // =========================================================================
 // This device deliberately does NOT expose a virtual COM port. Serial.begin() is never called, so
 // the CDC interface (Adafruit_USBD_CDC, aka "Serial" under Adafruit TinyUSB) never gets added to
@@ -59,16 +62,26 @@ Adafruit_USBD_WebUSB usb_web;
 // CDC-based design and read/written the same way, just over `usb_web` (a Stream, like Serial was)
 // instead of `Serial`.
 //
-// Telemetry packet (17 bytes). Channels 2-4 (shift/torque) are sent on their own configurable
-// polling rate (see cfg_freq[] below) -- e.g. torque can run much faster than shift without
-// affecting shift's cadence, and vice versa. Channels 0-1 (RPM1/RPM2) are edge-triggered instead
-// of polled: one packet is sent per physical tooth as soon as it's detected, with NO fixed rate --
-// cfg_freq[0]/cfg_freq[1] have no effect (see the comment on cfg_freq[] below).
-//   [0]    0xAA  sync byte 0
-//   [1]    0x55  sync byte 1
-//   [2]    channel id (0..5)
-//   [3]    per-channel rolling sequence number (drop detection on the receiving end)
-//   [4..7] int32 value, little-endian --
+// Telemetry packet (21 bytes -- widened from 17 in protocol v1, see PROTOCOL_VERSION above).
+// Channels 2-4 (shift/torque) are sent on their own configurable polling rate (see cfg_freq[]
+// below) -- e.g. torque can run much faster than shift without affecting shift's cadence, and vice
+// versa. Channels 0-1 (RPM1/RPM2) are edge-triggered instead of polled: one packet is sent per
+// physical tooth as soon as it's detected, with NO fixed rate -- cfg_freq[0]/cfg_freq[1] have no
+// effect (see the comment on cfg_freq[] below). All channels use the same fixed 21-byte layout
+// (rather than a shorter packet for non-RPM channels) so the sync-byte framer never has to inspect
+// a channel byte to know how many bytes to expect -- simpler and more robust than the bandwidth
+// saved is worth, especially since bandwidth was never the bottleneck here (the RP2040's own RPM
+// event ring and the host's draining rate are).
+//   [0]     0xAA  sync byte 0
+//   [1]     0x55  sync byte 1
+//   [2]     channel id (0..5)
+//   [3]     per-channel rolling sequence number (drop detection on the receiving end) -- assigned
+//           at TRANSMIT time, so this can only ever reveal loss AFTER an event was already queued
+//           for sending (i.e. downstream/USB loss). It cannot reveal an event that was dropped
+//           before it was ever queued (e.g. RpmCounter's ring buffer overflowing) -- see
+//           edgeCount below, which is assigned earlier, at ISR capture time, specifically to make
+//           that other kind of loss detectable too.
+//   [4..7]  int32 value, little-endian --
 //           for channels 0-1 (RPM1/RPM2) this is the raw inter-edge period in microseconds since
 //           the previous tooth on that channel, NOT an RPM value -- the host reconstructs RPM
 //           itself: rpm = 60,000,000 / (period_us * teeth_per_revolution), since spoke/tooth count
@@ -84,7 +97,14 @@ Adafruit_USBD_WebUSB usb_web;
 //           for RPM channels, or the moment read for shift/torque), not when this packet happened
 //           to be sent, so a receiver can rebuild an accurate per-channel timeline even though
 //           channels arrive at different rates.
-//   [16]   CRC-8 (poly 0x07, init 0x00) over bytes [2..15]
+//   [16..19] uint32 edge counter, little-endian -- for channels 0-1 (RPM1/RPM2) only, this is
+//           RpmCounter's monotonically increasing physical-edge count for that channel, assigned
+//           at ISR capture time (see RpmCounter.h's popEdge() for the full reasoning). A gap here
+//           on the receiving end means an edge was lost BEFORE it ever reached the ring/USB (e.g.
+//           a transient host stall overflowing the ring) -- distinct from a gap in the sequence
+//           number above, which means a queued packet was lost in transit. Always 0 for channels
+//           2-5, which have no concept of a physical edge.
+//   [20]    CRC-8 (poly 0x07, init 0x00) over bytes [2..19]
 //
 // Channel 5 (full throttle) is also a binary input reported purely on change, not on a schedule --
 // it has no entry in cfg_write_en[]/cfg_freq[] (there is no "rate" to configure) and is instead
@@ -92,8 +112,8 @@ Adafruit_USBD_WebUSB usb_web;
 // happened rather than waiting for the next poll.
 #define TELEMETRY_SYNC0 0xAA
 #define TELEMETRY_SYNC1 0x55
-#define TELEMETRY_PACKET_LEN 17
-#define TELEMETRY_CRC_SPAN 14 // bytes [2..15]
+#define TELEMETRY_PACKET_LEN 21
+#define TELEMETRY_CRC_SPAN 18 // bytes [2..19]
 #define CHANNEL_FULL_THROTTLE 5
 
 // Command packet (5 bytes) -- a leading sync byte lets the parser resync after any dropped or
@@ -247,14 +267,26 @@ void injectDemoRpmEdges(float phase) {
   static uint64_t lastDemoEdgeUs[2] = {0, 0};
   const uint64_t nowUs = time_us_64();
 
-  // Two superimposed sine waves (a fast oscillation plus a much slower "drift" one) instead of a
-  // fast oscillation plus a raw linear `phase * k` term -- the linear term grew without bound for
-  // as long as bench mode stayed enabled (confirmed live: primary RPM reaching ~35,000+ after a
-  // few minutes, since phase is elapsed seconds and never resets). A slow sine wave gives the same
-  // "not just a fixed, repetitive oscillation" demo character while staying bounded indefinitely,
-  // however long a bench session runs.
-  const float demoRpm1 = 4200 + (sin(phase) * 1100) + (sin(phase * 0.015f) * 500);
-  const float demoRpm2 = 2850 + (sin(phase - 0.55f) * 720) + (sin((phase * 0.011f) - 0.3f) * 350);
+  // Repeating ~60s "pull cycle" superimposed on a fast fine-grained oscillation, instead of just
+  // two idle-like sine waves -- deliberately shaped to reproduce the SAME real-dyno-pull signature
+  // that led to the loss-robustness investigation (see EVENT_RING_SIZE/edgeCount in RpmCounter):
+  // primary ramping up hard while secondary drops (the CVT shifting under increasing load), both
+  // recovering afterward. This gives demo mode a repeatable way to exercise a genuinely higher,
+  // correlated primary/secondary edge rate -- the exact condition that stresses the shared
+  // downstream USB/host pipeline -- so loss-robustness changes can be stress-tested without the
+  // physical dyno running. pullEnvelope is 0 at the start/end of each cycle and 1 at its midpoint;
+  // fmod (not a raw growing phase) keeps this bounded indefinitely for however long bench mode
+  // stays enabled, same reasoning as the drift fix below.
+  const float pullCycleSeconds = 60.0f;
+  const float pullEnvelope = sin((fmod(phase, pullCycleSeconds) / pullCycleSeconds) * 3.14159265f); // 0 -> 1 -> 0 each cycle
+  // Baseline (resting/idle) component: two superimposed sine waves (a fast oscillation plus a much
+  // slower "drift" one) instead of a fast oscillation plus a raw linear `phase * k` term -- the
+  // linear term grew without bound for as long as bench mode stayed enabled (confirmed live:
+  // primary RPM reaching ~35,000+ after a few minutes, since phase is elapsed seconds and never
+  // resets). A slow sine wave gives the same "not just a fixed, repetitive oscillation" demo
+  // character while staying bounded indefinitely, however long a bench session runs.
+  const float demoRpm1 = 3000 + (sin(phase) * 400) + (sin(phase * 0.015f) * 200) + pullEnvelope * 3000; // baseline ~2400-3600, peaks ~6600 mid-pull
+  const float demoRpm2 = 3000 - pullEnvelope * 2200 + (sin(phase - 0.55f) * 300) + (sin((phase * 0.011f) - 0.3f) * 150); // baseline ~2550-3450, dips toward ~350 mid-pull (shifting under load) then recovers
   // One "tooth" every 60e6 / (rpm * teeth) us -- mirrors the real reciprocal-counting relationship
   // (see the telemetry packet comment on channels 0/1) so demo mode exercises a realistic cadence.
   const uint32_t periodUs1 = (demoRpm1 > 0) ? (uint32_t)(60000000.0f / (demoRpm1 * DEMO_RPM1_TEETH)) : 0;
@@ -624,7 +656,8 @@ void loop() {
     for (uint8_t ch = 0; ch <= 1; ch++) {
       uint64_t edgeUs = 0;
       uint32_t periodUs = 0;
-      if (!RpmCounter::popEdge(ch, edgeUs, periodUs)) continue;
+      uint32_t edgeCount = 0;
+      if (!RpmCounter::popEdge(ch, edgeUs, periodUs, edgeCount)) continue;
       moreRpmEdges = true;
       if (!cfg_write_en[ch]) continue;
 
@@ -636,7 +669,8 @@ void loop() {
       packet[3] = tx_seq[ch]++;
       memcpy(&packet[4], &payload_val, 4);
       memcpy(&packet[8], &edgeUs, 8);
-      packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
+      memcpy(&packet[16], &edgeCount, 4);
+      packet[20] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
 
       usb_web.write(packet, TELEMETRY_PACKET_LEN);
     }
@@ -665,7 +699,8 @@ void loop() {
       packet[3] = tx_seq[i]++;
       memcpy(&packet[4], &payload_val, 4);
       memcpy(&packet[8], &capture_us, 8);
-      packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
+      memset(&packet[16], 0, 4); // no physical-edge concept for shift/torque -- see the protocol comment above
+      packet[20] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
 
       usb_web.write(packet, TELEMETRY_PACKET_LEN);
     }
@@ -689,7 +724,8 @@ void loop() {
     packet[3] = tx_seq[CHANNEL_FULL_THROTTLE]++;
     memcpy(&packet[4], &payload_val, 4);
     memcpy(&packet[8], &throttleCaptureUs, 8);
-    packet[16] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
+    memset(&packet[16], 0, 4); // no physical-edge concept for full throttle -- see the protocol comment above
+    packet[20] = crc8(&packet[2], TELEMETRY_CRC_SPAN);
     usb_web.write(packet, TELEMETRY_PACKET_LEN);
   }
   // No per-iteration usb_web.flush(): let the vendor bulk endpoint batch writes naturally instead
