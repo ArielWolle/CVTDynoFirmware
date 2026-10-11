@@ -26,8 +26,8 @@
 #define PROTOCOL_VERSION 2
 
 // --- PIN DEFINITIONS ---
-const int PIN_RPM1   = 3;  // Must be ODD
-const int PIN_RPM2   = 1;  // Must be ODD
+const int PIN_RPM1   = 1;  // Must be ODD
+const int PIN_RPM2   = 3;  // Must be ODD
 const int PIN_SHIFT  = 26; // Analog A0
 const int PIN_ADS_CS   = 17; 
 const int PIN_ADS_DRDY = 20; 
